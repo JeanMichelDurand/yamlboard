@@ -1,0 +1,45 @@
+[project]
+name = "yamlboard"
+version = "0.1.0"
+description = "Declare a SQL report in YAML; get a chart and a table you can filter and aggregate, on the fields the report allows."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "altair>=5",
+    "duckdb>=1.1",
+    "duckdb-engine>=0.13",
+    "openpyxl>=3.1",
+    "pandas>=2",
+    "pydantic>=2.6",
+    "pytz>=2023",
+    "pyyaml>=6",
+    "sqlalchemy>=2",
+    "streamlit>=1.45",
+]
+
+[project.optional-dependencies]
+postgres = [
+    "psycopg[binary]>=3.1",
+]
+
+[project.scripts]
+yamlboard = "yamlboard.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+extend-select = ["I", "UP", "B"]
+# Naive UTC datetimes by design (times.py); the tests build windows relative to date.today().
+ignore = ["DTZ001", "DTZ011"]

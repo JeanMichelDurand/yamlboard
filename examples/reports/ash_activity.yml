@@ -1,0 +1,144 @@
+# Written with the legacy French keys: they load unchanged.
+# The SQL fakes an active-session-history table in DuckDB (last 3 days, one sample per 10 s)
+# so the example runs anywhere; on a real database the SQL reads the real view.
+---
+id: ash-activity
+title: Database activity
+description: Active sessions sampled every 10 seconds, by wait class
+actif: true
+filename: ash-activity
+formats:
+  - CSV
+  - JSON
+right:
+  - dba
+customParameters:
+  - label: Start date
+    mapping: datedeb
+    type: Date
+    required: true
+  - label: End date
+    mapping: datefin
+    type: Date
+    required: true
+customParametersFormType:
+  - paramsId: datedeb
+    optionalParamsId: datefin
+    type: DATE_RANGE
+    # yamlboard key: the range applies to this timestamp field and keeps the whole end day.
+    # `where sample_time_utc between :datedeb and :datefin` would stop at midnight on it.
+    field: sample_time_utc
+customParametersValidators:
+  - paramsId: datedeb
+    optionalParamsId: datefin
+    value: 1
+    type: DAY_BETWEEN
+sql: >
+  select sample_time_utc,
+    coalesce(wait_class, 'CPU') as wait_class,
+    coalesce(event, 'CPU') as event,
+    top_level_sql_id,
+    sql_plan_hash_value,
+    sql_id,
+    machine,
+    program,
+    'select /* ' || sql_id || ' */ ...' as sql_text
+  from (
+    select
+      cast(current_date as timestamp) - interval 2 day + to_seconds((i // 4) * 10) as sample_time_utc,
+      case hash(i, 'w') % 6 when 0 then 'User I/O' when 1 then 'Concurrency'
+        when 2 then 'Commit' when 3 then 'Network' end as wait_class,
+      case hash(i, 'w') % 6 when 0 then 'db file sequential read' when 1 then 'enq: TX - row lock contention'
+        when 2 then 'log file sync' when 3 then 'SQL*Net more data from client' end as event,
+      'top_' || hash(i, 's') % 5 as top_level_sql_id,
+      cast(hash(i, 's') % 20 * 7919 as varchar) as sql_plan_hash_value,
+      'sql_' || hash(i, 's') % 20 as sql_id,
+      'app-0' || hash(i, 'm') % 3 + 1 as machine,
+      case hash(i, 'p') % 3 when 0 then 'JDBC Thin Client' when 1 then 'sqlplus' else 'batch' end as program
+    from range(0, 4 * 8640 * 3) t(i)
+  )
+slice:
+  rows:
+    - uniqueName: sample_time_utc
+  columns:
+    - uniqueName: wait_class
+  measures:
+    - uniqueName: "*"
+      aggregation: count
+options:
+  viewType: charts
+  chart:
+    type: column-stacked
+result_columns:
+  - mapping: sample_time_utc
+    type: Timestamp
+    label: Date
+    affichageDefaut: true
+    agregationLigne: true
+    agregationColone: true
+    filtrage: true
+    availableGroupingDateType:
+      - HEURES
+      - MINUTES
+      - JOUR
+  - mapping: wait_class
+    type: String
+    label: Wait class
+    filtrage: true
+    agregationLigne: true
+    agregationColone: true
+    # yamlboard key: each value's colour in a chart, Enterprise Manager's for the wait classes. Users can change
+    # them on the board (the palette icon on the chart).
+    colors:
+      CPU: "#00cc00"
+      User I/O: "#0054d6"
+      System I/O: "#0099ff"
+      Concurrency: "#8b1a00"
+      Application: "#c02800"
+      Commit: "#e46800"
+      Configuration: "#5c440b"
+      Administrative: "#717354"
+      Network: "#9f9371"
+      Cluster: "#c9c2af"
+      Queueing: "#c2b79b"
+      Other: "#f06eaa"
+  - mapping: event
+    type: String
+    label: Event
+    filtrage: true
+    agregationLigne: true
+    agregationColone: true
+    colors:
+      "enq: TX - row lock contention": "#d00000"
+  - mapping: top_level_sql_id
+    type: String
+    filtrage: true
+    agregationLigne: true
+    agregationColone: true
+  - mapping: sql_id
+    type: String
+    filtrage: true
+    agregationLigne: true
+    agregationColone: true
+  - mapping: sql_plan_hash_value
+    type: String
+    filtrage: true
+    agregationLigne: true
+    agregationColone: true
+  - mapping: machine
+    type: String
+    label: Machine
+    filtrage: true
+    agregationLigne: true
+    agregationColone: true
+  - mapping: program
+    type: String
+    label: Program
+    filtrage: true
+    agregationLigne: true
+    agregationColone: true
+  - mapping: sql_text
+    type: String
+    label: SQL text
+readme: |
+  <p>One row per active session per sample. Sessions not waiting are counted as <b>CPU</b>.</p>

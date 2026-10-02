@@ -1,0 +1,11 @@
+{
+  "yamlboard_dashboard": 1,
+  "name": "Overview",
+  "description": "Sales and database activity at a glance: each chart opens on the Reports page with its icon.",
+  "grid": {"columns": 2, "height": 300},
+  "cells": [
+    {"view": "views/sales-by-region.json"},
+    {"report": "sales", "title": "Orders by product", "view": {"chart": "donut", "row": "product", "measure": "count"}},
+    {"report": "ash-activity", "title": "Database activity by wait class", "width": 2}
+  ]
+}

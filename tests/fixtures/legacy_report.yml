@@ -1,0 +1,88 @@
+# A report in the legacy format (French keys, Oracle SQL), written for the tests: every legacy key
+# yamlboard maps, plus keys it ignores (dashboard, async, dateTimePattern, GRAPH formats).
+---
+id: LEGACY-01_Activite-Sessions
+title: Activité des sessions
+description: Activité des sessions
+category: support
+order: 4
+dashboard: true
+actif: true
+async: true
+filename: legacy-sessions
+formats:
+  - CSV
+  - JSON
+  - GRAPH
+  - FLEXMONSTER_PIVOT
+right:
+  - dba
+customParameters:
+  - label: Date de début
+    mapping: datedeb
+    type: Date
+    required: true
+  - label: Date de fin
+    mapping: datefin
+    type: Date
+    required: true
+customParametersFormType:
+  - paramsId: datedeb
+    optionalParamsId: datefin
+    type: DATE_RANGE
+customParametersValidators:
+  - paramsId: datedeb
+    optionalParamsId: datefin
+    value: 1
+    type: DAY_BETWEEN
+sql: >
+  select sample_time_utc,
+  nvl(wait_class, 'CPU') as wait_class,
+  sql_text
+  from session_samples
+  where sample_time_utc between :datedeb AND :datefin
+
+
+slice:
+  rows:
+    - uniqueName: sample_time_utc
+  columns:
+    - uniqueName: wait_class
+  measures:
+    - uniqueName: "*"
+      aggregation: count
+options:
+  viewType: charts
+  chart:
+    type: column-stacked
+    showLegendButton: true
+    showDataLabels: true
+  dateTimePattern: dd/MM/yyyy
+fields:
+
+  - mapping: sample_time_utc
+    type: Timestamp
+    label: Date
+    affichageDefaut: true
+    agregationLigne: true
+    agregationColone: true
+    filtrage: true
+    availableGroupingDateType:
+      - MINUTES
+      - HEURES
+      - JOUR
+
+  - mapping: wait_class
+    type: String
+    label: wait_class
+    filtrage: true
+    affichageDefaut: true
+    agregationLigne: true
+    agregationColone: true
+
+  - mapping: sql_text
+    type: String
+    label: sql_text
+    affichageDefaut: true
+readme: |
+  <p>Une ligne par session active et par échantillon.</p>

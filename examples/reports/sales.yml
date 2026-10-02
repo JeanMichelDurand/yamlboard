@@ -1,0 +1,78 @@
+# Written with the canonical English keys.
+# The SQL fakes a year of orders in DuckDB so the example runs anywhere.
+id: sales
+title: Sales
+description: Orders over the last year, by region, product and channel
+parameters:
+  - name: start
+    label: From
+    type: date
+    required: true
+  - name: end
+    label: To
+    type: date
+    required: true
+ranges:
+  - start: start
+    end: end
+rules:
+  - param: start
+    other: end
+    rule: max_days
+    value: 366
+sql: |
+  select order_id, order_date, region, product, channel, quantity, round(quantity * unit_price, 2) as amount
+  from (
+    select
+      'O' || lpad(cast(i as varchar), 6, '0') as order_id,
+      current_date - cast(i % 365 as integer) as order_date,
+      ['North', 'South', 'East', 'West'][1 + cast(hash(i, 'r') % 4 as integer)] as region,
+      ['Widget', 'Gadget', 'Gizmo'][1 + cast(hash(i, 'p') % 3 as integer)] as product,
+      case when hash(i, 'c') % 4 = 0 then null when hash(i, 'c') % 2 = 0 then 'web' else 'store' end as channel,
+      1 + cast(hash(i, 'q') % 9 as integer) as quantity,
+      [4.5, 12.0, 30.0][1 + cast(hash(i, 'p') % 3 as integer)] as unit_price
+    from range(0, 20000) t(i)
+  )
+  where order_date between :start and :end
+result_columns:               # the columns of the SQL result, and what users may do with each
+  - name: order_date
+    type: date
+    label: Order date
+    filterable: true
+    groupable_rows: true
+    grains: all                  # day to year (minute to year on a timestamp)
+  - name: region
+    label: Region
+    filterable: true
+    groupable: true          # both rows and columns
+  - name: product
+    label: Product
+    filterable: true
+    groupable: true
+  - name: channel
+    label: Channel
+    filterable: true
+    groupable: true
+  - name: quantity
+    type: integer
+    label: Quantity
+    filterable: true
+    measures: [sum, avg, min, max]
+  - name: amount
+    type: number
+    label: Amount
+    filterable: true
+    measures: [sum, avg, median, max]
+  - name: order_id
+    label: Order
+    measures: [count_distinct]
+view:
+  rows: [order_date]
+  grains: {order_date: month}
+  columns: [region]
+  measures:
+    - field: amount
+      aggregation: sum
+  chart: line
+readme: |
+  <p>Synthetic data. <b>Channel</b> is empty for a quarter of the orders, to show how empty values filter.</p>

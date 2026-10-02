@@ -1,0 +1,3 @@
+# name: SQLAlchemy URL. ${VAR} is read from the environment, so no credential is written here.
+default: "duckdb:///:memory:"
+# warehouse: "postgresql+psycopg://reporting:${PGPASSWORD}@localhost:5432/warehouse"

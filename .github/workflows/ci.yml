@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [main]            # a pull request's branch is tested by the pull_request event
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/ruff-action@v3      # settings in pyproject.toml [tool.ruff]
+        with:
+          version: "0.16.10"                # pinned: a new ruff's default rules must not turn main red
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]            # oldest supported (requires-python) and newest
+    runs-on: ubuntu-latest                  # a server-side library: no desktop build to cover
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install . pytest
+      - run: python -m pytest              # DuckDB only: the PostgreSQL tests skip without YAMLBOARD_TEST_PG_URL
+      - name: package installs and runs
+        run: |
+          yamlboard validate examples/reports
+          yamlboard sql examples/reports/sales.yml -p start=2026-01-01 -p end=2026-06-30 --dialect postgresql
+
+  # The one check branch protection requires (.github/rulesets/main.json): green only when every
+  # job above is, so adding or renaming a job never needs a settings change.
+  ci-ok:
+    if: always()
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = false
