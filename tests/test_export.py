@@ -14,7 +14,7 @@ import pytest
 
 from yamlboard import cli, export, logs
 from yamlboard import query as q
-from yamlboard.engine import engine_for, run
+from yamlboard.engine import DB_ERRORS, engine_for, run
 
 
 def test_formats():
@@ -51,7 +51,7 @@ def test_each_run_is_logged_with_its_id_and_sql(caplog):
 
 def test_a_failed_run_is_logged(caplog):
     engine = engine_for("duckdb:///:memory:")
-    with caplog.at_level(logging.INFO, logger="yamlboard"), pytest.raises(pd.errors.DatabaseError):
+    with caplog.at_level(logging.INFO, logger="yamlboard"), pytest.raises(DB_ERRORS):  # pandas 3 wraps the error, pandas 2 does not
         run(engine, q.Statement("SELECT nope", {}))
     assert any(r.levelno == logging.WARNING and "failed" in r.getMessage() for r in caplog.records)
 
