@@ -486,6 +486,8 @@ def _rule_problems(r: ParamRule, params: dict[str, Parameter]) -> list[str]:
     for n in filter(None, (r.param, r.other)):
         if not params[n].type.temporal:
             problems.append(f"rules: {r.rule.value} needs date or timestamp parameters, {n!r} is {params[n].type.value}")
+    if r.other and ptype.temporal and params[r.other].type.temporal and params[r.other].type is not ptype:
+        problems.append(f"{where}: {r.other!r} is {params[r.other].type.value}, both ends must be the same type")
     return problems
 
 

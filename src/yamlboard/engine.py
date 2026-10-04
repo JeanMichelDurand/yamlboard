@@ -20,7 +20,7 @@ from sqlalchemy.pool import NullPool
 from yamlboard import times
 from yamlboard.dialects import Dialect, for_name
 from yamlboard.query import Statement, probe, resolve_columns
-from yamlboard.schema import _LITERALS, DATASOURCES_FILE, Report, load_reports
+from yamlboard.schema import _BIND, _LITERALS, DATASOURCES_FILE, Report, load_reports
 
 log = logging.getLogger("yamlboard")
 # What a failed run raises: SQLAlchemy's errors on connect, pandas' DatabaseError around a failed statement.
@@ -33,14 +33,20 @@ _TEXT_BIND = re.compile(r"(?<![:\w\\]):(\w+)(?!:)")
 def sql_text(sql: str) -> TextClause:
     """``sql`` as SQLAlchemy runs it, its ``:name`` binds read as ``schema.sql_binds`` reads them.
 
-    ``text()`` takes ``':a'`` in a string literal or a comment for a bind and fails for want of a value, where
-    the report's checks (and the lite's ``inline``) leave it alone: escaped here, it reaches the database as written.
+    ``text()`` takes ``':a'`` in a string literal or a comment for a bind, and ``[:2]`` (a DuckDB slice) anywhere,
+    and fails for want of a value, where the report's checks (and the lite's ``inline``) leave them alone: escaped
+    here, they reach the database as written.
     """
+
+    def code(part: str) -> str:
+        binds = {m.start(): m.group(1) for m in _BIND.finditer(part)}
+        return _TEXT_BIND.sub(lambda m: m.group() if binds.get(m.start()) == m.group(1) else "\\" + m.group(), part)
+
     out, last = [], 0
     for lit in _LITERALS.finditer(sql):
-        out += [sql[last:lit.start()], _TEXT_BIND.sub(r"\\:\1", lit.group())]
+        out += [code(sql[last:lit.start()]), _TEXT_BIND.sub(r"\\:\1", lit.group())]
         last = lit.end()
-    return text("".join([*out, sql[last:]]))
+    return text("".join([*out, code(sql[last:])]))
 
 
 def expand_env(url: str) -> str:

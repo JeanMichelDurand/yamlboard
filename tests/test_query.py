@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -140,6 +140,8 @@ def test_postgres_sql(sales, sales_params):
 
 def test_identifiers(sales):
     assert DUCK.ref("dateDebut") == "dateDebut" and DUCK.ref("my col") == '"my col"'
+    assert DUCK.ref("select") == '"select"' and PG.ref("User") == '"User"'   # reserved: quoted as written
+    assert PG.ref("Show") == "Show" and DUCK.ref("user") == "user"   # reserved in the other database only
     assert DUCK.quote('a"b') == '"a""b"'
     assert dialect_of(engine_for("duckdb:///:memory:")) is DUCK
     with pytest.raises(ValueError, match="unsupported database 'oracle'"):
@@ -346,3 +348,25 @@ def test_default_grain_without_a_period():
 def test_default_view_opens_on_the_period_grain(sales):
     stmt = q.default_view(sales, DUCK, {"start": date(2026, 1, 1), "end": date(2026, 1, 31)})
     assert "date_trunc('day'" in stmt.sql
+
+
+def test_rules_on_a_span():
+    report = Report.model_validate({
+        "id": "r", "title": "R", "sql": "select a from t where a between :p and :q",
+        "parameters": [{"name": "p", "type": "date"}, {"name": "q", "type": "date"}],
+        "fields": [{"name": "a"}], "rules": [{"param": "p", "other": "q", "rule": "max_days", "value": 3}],
+    })
+    assert q.check_rules(report, {"p": date(2026, 1, 1), "q": date(2026, 1, 4)}) == []
+    assert len(q.check_rules(report, {"p": date(2026, 1, 5), "q": date(2026, 1, 1)})) == 1
+    assert "spans more than 3 day(s)" in q.check_rules(report, {"p": date(2026, 1, 1), "q": date(2026, 1, 9)})[0]
+    # a date against a timestamp (the schema refuses it): checked, not a TypeError
+    assert q.check_rules(report, {"p": date(2026, 1, 1), "q": datetime(2026, 1, 3, 12)}) == []
+
+
+def test_a_reserved_field_name_runs_without_a_column_map():
+    report = Report.model_validate({
+        "id": "r", "title": "R", "sql": 'select 1 as "select", 2 as n',
+        "fields": [{"name": "select", "groupable": True}, {"name": "n", "type": "integer", "measures": ["sum"]}],
+    })
+    stmt = q.aggregate(report, DUCK, {}, rows=[q.Group("select")], measures=[q.Measure("n", A.SUM)])
+    assert run(engine_for("duckdb:///:memory:"), stmt).iloc[0].tolist() == [1, 2]

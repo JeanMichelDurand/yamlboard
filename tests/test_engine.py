@@ -44,3 +44,9 @@ def test_a_colon_in_a_literal_or_a_comment_is_not_a_bind():
     df = run(engine_for("duckdb:///:memory:"), Statement(sql, {"v": 1}))
     assert df.iloc[0].tolist() == [":a", "x :b y", 1]
     assert sql_text("select '12:30', 'a::int'").text == "select '12:30', 'a::int'"   # no bind there: unchanged
+
+
+def test_a_slice_is_not_a_bind():
+    """SQLAlchemy reads ``:2`` as a bind, ``schema.sql_binds`` does not: the report validates, so it runs."""
+    df = run(engine_for("duckdb:///:memory:"), Statement("select [1,2,3][:2] as x, :v as v", {"v": 1}))
+    assert df.iloc[0].tolist()[1] == 1 and list(df.iloc[0]["x"]) == [1, 2]

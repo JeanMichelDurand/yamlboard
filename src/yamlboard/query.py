@@ -151,6 +151,8 @@ def check_rules(report: Report, values: dict[str, Any]) -> list[str]:
             other = values.get(r.other) if r.other else None
             if other is None:
                 continue
+            if isinstance(v, datetime) is not isinstance(other, datetime):  # the schema refuses mixed ends
+                v, other = times.parse_timestamp(v), times.parse_timestamp(other)
             if other < v:
                 problems.append(f"{name} must not be after {params[r.other].title}")
             limit = timedelta(days=r.value) if r.rule is Rule.MAX_DAYS else timedelta(hours=r.value)
