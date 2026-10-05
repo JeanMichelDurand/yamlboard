@@ -370,3 +370,20 @@ def test_a_reserved_field_name_runs_without_a_column_map():
     })
     stmt = q.aggregate(report, DUCK, {}, rows=[q.Group("select")], measures=[q.Measure("n", A.SUM)])
     assert run(engine_for("duckdb:///:memory:"), stmt).iloc[0].tolist() == [1, 2]
+
+
+@pytest.mark.parametrize("rid", ["ash-activity", "pg-activity", "app-log", "duckdb-catalog"])
+def test_examples_run_their_view(ws, rid, tmp_path, monkeypatch):
+    """Each example's default view returns rows; the catalog reads a DuckDB file with a table and a view."""
+    import duckdb
+
+    db = tmp_path / "demo.duckdb"
+    with duckdb.connect(str(db)) as con:
+        con.execute("create table t (a int, b varchar); create view v as select a from t")
+    monkeypatch.setenv("YAMLBOARD_DUCKDB", str(db))
+    report = ws.reports[rid]
+    engine = engine_for(ws.url(report))
+    span = {r.start: str(date.today() - timedelta(days=1)) for r in report.ranges}
+    params = q.coerce_parameters(report, span | {r.end: str(date.today()) for r in report.ranges})
+    df = run(engine, q.default_view(report, DUCK, params, columns_map=columns_for(engine, report, params)))
+    assert len(df) > 0 and df.iloc[:, -1].sum() > 0

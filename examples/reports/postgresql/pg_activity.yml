@@ -1,0 +1,95 @@
+# The PostgreSQL counterpart of ash_activity.yml, written with the canonical English keys.
+# PostgreSQL keeps no session history of its own: the pgsentinel extension samples pg_stat_activity into the
+# view pg_active_session_history (every pgsentinel_ash.sampling_period seconds, default 1; a ring buffer of
+# pgsentinel_ash.max_entries rows, default 1000, so raise it or copy the view to a table for days of history).
+# On a real server, with `datasource:` naming a PostgreSQL entry of datasources.yml, the SQL is:
+#
+#   select ash_time at time zone 'UTC' as sample_time_utc,
+#     coalesce(wait_event_type, 'CPU') as wait_event_type,
+#     coalesce(wait_event, 'CPU') as wait_event,
+#     cast(queryid as text) as queryid, cmdtype, datname, usename, application_name,
+#     host(client_addr) as client_addr, backend_type, left(query, 500) as query
+#   from pg_active_session_history
+#   where state = 'active'
+#
+# The SQL below fakes that view in DuckDB (last 3 days, one sample per 10 s) so the example runs anywhere.
+id: pg-activity
+title: Database activity
+description: Active sessions sampled by pgsentinel, by wait event type
+rights: [dba]
+formats: [CSV, JSON]
+parameters:
+  - {name: start, type: date, required: true, label: Start date}
+  - {name: end, type: date, required: true, label: End date}
+ranges:
+  # Applied to this timestamp field, keeping the whole end day.
+  - {start: start, end: end, field: sample_time_utc}
+rules:
+  - {param: start, other: end, rule: max_days, value: 1}
+sql: |
+  select sample_time_utc,
+    coalesce(wait_event_type, 'CPU') as wait_event_type,
+    coalesce(wait_event, 'CPU') as wait_event,
+    queryid, cmdtype, datname, usename, application_name, client_addr, backend_type,
+    cmdtype || ' /* ' || queryid || ' */ ...' as query
+  from (
+    select
+      cast(current_date as timestamp) - interval 2 day + to_seconds((i // 3) * 10) as sample_time_utc,
+      case hash(i, 'w') % 7 when 0 then 'IO' when 1 then 'Lock' when 2 then 'LWLock'
+        when 3 then 'Client' when 4 then 'IPC' end as wait_event_type,
+      case hash(i, 'w') % 7 when 0 then 'DataFileRead' when 1 then 'transactionid' when 2 then 'WALWrite'
+        when 3 then 'ClientRead' when 4 then 'BgWorkerShutdown' end as wait_event,
+      cast(cast(hash(i, 'q') % 20 as bigint) * 7919 - 70000 as varchar) as queryid,
+      ['SELECT', 'SELECT', 'UPDATE', 'INSERT', 'DELETE'][1 + cast(hash(i, 'q') % 5 as integer)] as cmdtype,
+      ['shop', 'shop', 'billing'][1 + cast(hash(i, 'd') % 3 as integer)] as datname,
+      ['app', 'app', 'batch', 'reporting'][1 + cast(hash(i, 'u') % 4 as integer)] as usename,
+      ['PostgreSQL JDBC Driver', 'psql', 'pg_dump'][1 + cast(hash(i, 'a') % 3 as integer)] as application_name,
+      '10.0.0.' || (11 + hash(i, 'm') % 3) as client_addr,
+      case when hash(i, 'b') % 25 = 0 then 'autovacuum worker' else 'client backend' end as backend_type
+    from range(0, 3 * 8640 * 3) t(i)
+  )
+result_columns:
+  - name: sample_time_utc
+    type: timestamp
+    label: Date
+    filterable: true
+    groupable: true
+    grains: [hour, minute, day]
+  - name: wait_event_type
+    label: Wait event type
+    filterable: true
+    groupable: true
+    # Each value's colour in a chart, as close as PostgreSQL's types allow to Enterprise Manager's wait classes.
+    colors:
+      CPU: "#00cc00"
+      IO: "#0054d6"
+      Lock: "#c02800"
+      LWLock: "#8b1a00"
+      BufferPin: "#e46800"
+      IPC: "#9f9371"
+      Client: "#717354"
+      Timeout: "#c2b79b"
+      Extension: "#f06eaa"
+      Activity: "#c9c2af"
+  - name: wait_event
+    label: Wait event
+    filterable: true
+    groupable: true
+    colors:
+      transactionid: "#d00000"
+  - {name: queryid, filterable: true, groupable: true}
+  - {name: cmdtype, label: Command, filterable: true, groupable: true}
+  - {name: datname, label: Database, filterable: true, groupable: true}
+  - {name: usename, label: User, filterable: true, groupable: true}
+  - {name: application_name, label: Application, filterable: true, groupable: true}
+  - {name: client_addr, label: Client, filterable: true, groupable: true}
+  - {name: backend_type, label: Backend, filterable: true, groupable: true}
+  - {name: query, label: SQL text}
+view:
+  rows: [sample_time_utc]
+  columns: [wait_event_type]
+  measures: [{field: "*", aggregation: count}]
+  chart: column-stacked
+readme: |
+  <p>One row per active session per sample. Sessions active and not waiting are counted as <b>CPU</b>.
+  The PostgreSQL counterpart of Oracle's ASH, read from the pgsentinel extension.</p>

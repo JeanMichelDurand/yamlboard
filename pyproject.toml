@@ -1,6 +1,6 @@
 [project]
 name = "yamlboard"
-version = "0.1.0"
+version = "1.0.0"
 description = "Declare a SQL report in YAML; get a chart and a table you can filter and aggregate, on the fields the report allows."
 readme = "README.md"
 license = "MIT"

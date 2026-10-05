@@ -59,7 +59,16 @@ view:                            # what the report opens on
   chart: line
 ```
 
-Full examples: [examples/reports/](examples/reports/).
+Full examples, in [examples/reports/](examples/reports/). Each fakes its data in DuckDB so it runs anywhere,
+and its header comment gives the SQL for the real source:
+
+| File | What it shows |
+|---|---|
+| [`sales.yml`](examples/reports/sales.yml) | The canonical keys: a date range, a span rule, measures on numbers |
+| [`ash_activity.yml`](examples/reports/ash_activity.yml) | Oracle's active session history by wait class, in the legacy French keys, with colours per value |
+| [`postgresql/pg_activity.yml`](examples/reports/postgresql/pg_activity.yml) | Its PostgreSQL counterpart: `pg_active_session_history` from the pgsentinel extension, by wait event type |
+| [`files/app_log.yml`](examples/reports/files/app_log.yml) | A log file cut into columns by a regular expression (the dev app's *Python logging* pattern plus a duration) |
+| [`duckdb/catalog.yml`](examples/reports/duckdb/catalog.yml) | DuckDB's `information_schema`: tables, views and columns of a database file. Reads the `catalog` datasource: set `YAMLBOARD_DUCKDB` to the file's path |
 
 ### Reference
 

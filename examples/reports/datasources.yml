@@ -1,3 +1,5 @@
 # name: SQLAlchemy URL. ${VAR} is read from the environment, so no credential is written here.
 default: "duckdb:///:memory:"
+# duckdb/catalog.yml: a DuckDB file, read-only. export YAMLBOARD_DUCKDB=/path/to/file.duckdb
+catalog: "duckdb:///${YAMLBOARD_DUCKDB}?access_mode=read_only"
 # warehouse: "postgresql+psycopg://reporting:${PGPASSWORD}@localhost:5432/warehouse"

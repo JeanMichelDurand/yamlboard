@@ -1,0 +1,72 @@
+# A log file as a source, written with the canonical English keys. Each line is cut into columns by the
+# dev app's "Python logging" pattern (time level logger message), plus an optional duration; a line that
+# does not match (a traceback) is left out. The dev app's *File* page drafts such a report from a real file.
+# On a real file, on a duckdb:///:memory: datasource, replace the `lines` subquery with:
+#
+#   select line from read_csv('/var/log/app/*.log', columns = {'line': 'VARCHAR'}, header = false,
+#                             delim = '\0', quote = '', escape = '', auto_detect = false)
+#
+# The SQL below fakes three days of an application's log in DuckDB so the example runs anywhere.
+id: app-log
+title: Application log
+description: Log records by level, logger and duration, parsed from the lines of a log file
+formats: [CSV, JSON]
+parameters:
+  - {name: start, type: date, required: true, label: From}
+  - {name: end, type: date, required: true, label: To}
+ranges:
+  - {start: start, end: end, field: time}
+rules:
+  - {param: start, other: end, rule: max_days, value: 31}
+sql: |
+  select try_cast(replace(nullif(m['time'], ''), ',', '.') as timestamptz) as time,
+    nullif(m['level'], '') as level,
+    nullif(m['logger'], '') as logger,
+    try_cast(nullif(m['duration_ms'], '') as bigint) as duration_ms,
+    nullif(m['message'], '') as message
+  from (
+    select regexp_extract(line,
+      '^(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) (?P<level>[A-Z]+) (?P<logger>\S+) (?P<message>.*?(?: in (?P<duration_ms>\d+) ms)?)$',
+      ['time', 'level', 'logger', 'message', 'duration_ms']) as m
+    from (
+      select case when i % 997 = 0 then '  File "app/handlers.py", line 42, in checkout'
+        else strftime(cast(current_date as timestamp) - interval 2 day + to_seconds(i * 3), '%Y-%m-%d %H:%M:%S,%g')
+          || ' ' || case when hash(i, 'l') % 50 = 0 then 'ERROR' when hash(i, 'l') % 10 = 0 then 'WARNING'
+                         else 'INFO' end
+          || ' ' || ['app.http', 'app.http', 'app.db', 'app.auth'][1 + cast(hash(i, 'g') % 4 as integer)]
+          || ' ' || case when hash(i, 'l') % 50 = 0 then 'POST /checkout 500'
+                         else ['GET /orders 200', 'POST /checkout 201', 'GET /health 200'][1 + cast(hash(i, 'm') % 3 as integer)] end
+          || ' in ' || (5 + hash(i, 'd') % 400) || ' ms'
+        end as line
+      from range(0, 86400) t(i)
+    ) lines
+    where regexp_matches(line,
+      '^(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) (?P<level>[A-Z]+) (?P<logger>\S+) (?P<message>.*?(?: in (?P<duration_ms>\d+) ms)?)$')
+  ) parsed
+result_columns:
+  - name: time
+    type: timestamp
+    label: Time
+    filterable: true
+    groupable_rows: true
+    grains: [hour, minute, day]
+  - name: level
+    label: Level
+    filterable: true
+    groupable: true
+    colors: {ERROR: "#d00000", WARNING: "#e46800", INFO: "#0099ff", DEBUG: "#c9c2af"}
+  - {name: logger, label: Logger, filterable: true, groupable: true}
+  - name: duration_ms
+    type: integer
+    label: Duration (ms)
+    filterable: true
+    measures: [avg, median, max]
+  - {name: message, label: Message, filterable: true, groupable_rows: true}
+view:
+  rows: [time]
+  grains: {time: hour}
+  columns: [level]
+  measures: [{field: "*", aggregation: count}]
+  chart: column-stacked
+readme: |
+  <p>One row per log record. A line the pattern does not match (a traceback, a continuation line) is left out.</p>

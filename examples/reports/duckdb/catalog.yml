@@ -1,0 +1,38 @@
+# DuckDB's information_schema, written with the canonical English keys: the tables and columns of a database
+# file. It reads the `catalog` datasource of datasources.yml, opened read-only: set YAMLBOARD_DUCKDB to the
+# file's path before starting the board. (On duckdb:///:memory: information_schema is empty.)
+id: duckdb-catalog
+title: Catalog
+description: Tables, views and columns of a DuckDB database file, from information_schema
+datasource: catalog
+formats: [CSV, JSON, XLSX]
+sql: |
+  select c.table_catalog, c.table_schema, c.table_name, t.table_type,
+    c.column_name, c.ordinal_position, c.data_type, c.is_nullable
+  from information_schema.columns c
+  join information_schema.tables t using (table_catalog, table_schema, table_name)
+result_columns:
+  - {name: table_catalog, label: Database, filterable: true, groupable: true}
+  - {name: table_schema, label: Schema, filterable: true, groupable: true}
+  - name: table_name
+    label: Table
+    filterable: true
+    groupable: true
+    measures: [count_distinct]
+  - name: table_type
+    label: Type
+    filterable: true
+    groupable: true
+    colors: {BASE TABLE: "#0054d6", VIEW: "#e46800", LOCAL TEMPORARY: "#c9c2af"}
+  - {name: column_name, label: Column, filterable: true, groupable_rows: true}
+  - {name: ordinal_position, type: integer, label: Position}
+  - {name: data_type, label: Data type, filterable: true, groupable: true}
+  - {name: is_nullable, label: Nullable, filterable: true, groupable: true}
+view:
+  rows: [table_schema]
+  columns: [table_type]
+  measures: [{field: table_name, aggregation: count_distinct}]
+  chart: bar-stacked
+readme: |
+  <p>One row per column. Counted by table, it lists the tables and views of each schema; split by data type,
+  it shows how the columns are typed.</p>

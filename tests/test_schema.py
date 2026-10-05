@@ -33,7 +33,7 @@ def test_legacy_keys_load_unchanged():
 
 
 def test_examples_load(ws):
-    assert set(ws.reports) == {"ash-activity", "sales"} and not ws.errors
+    assert set(ws.reports) == {"ash-activity", "sales", "pg-activity", "app-log", "duckdb-catalog"} and not ws.errors
 
 
 def test_groupable_shortcut_and_measures():
