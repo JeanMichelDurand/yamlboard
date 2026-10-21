@@ -8,8 +8,12 @@
 Declare a SQL report in a YAML file; get a chart and a table you can filter and aggregate,
 on the fields the report allows, and nothing else.
 
+**[Try yamlboard lite in your browser](https://jeanmicheldurand.github.io/yamlboard/)** (nothing to install, your
+file stays on your machine) · **[Releases](https://github.com/JeanMichelDurand/yamlboard/releases)** (wheel and
+source, notes per version)
+
 ```bash
-uv sync                                  # or: pip install -e .   (add [postgres] for PostgreSQL)
+uv sync                                  # from a clone; or see Install
 uv run yamlboard run examples/reports    # opens the Streamlit app
 uv run yamlboard dev --url data/w.duckdb # browse a database, test a query, draft a report (see Dev app)
 ```
@@ -22,6 +26,19 @@ uv run yamlboard dev --url data/w.duckdb # browse a database, test a query, draf
   aggregated result or one page of rows.
 - **DuckDB and PostgreSQL** today (DuckDB also reads Parquet and CSV files). A new database means one small
   class in `dialects.py`.
+
+## Install
+
+Python 3.10 or later. yamlboard is not on PyPI: install it from a
+[release](https://github.com/JeanMichelDurand/yamlboard/releases/latest) or from the repository.
+
+```bash
+pip install https://github.com/JeanMichelDurand/yamlboard/releases/download/v1.1.0/yamlboard-1.1.0-py3-none-any.whl
+pip install "yamlboard[postgres,ssh] @ git+https://github.com/JeanMichelDurand/yamlboard@v1.1.0"   # a tag, with extras
+```
+
+Extras: `postgres` (psycopg, for PostgreSQL datasources), `ssh` (paramiko, for `yamlboard fetch`). DuckDB and
+Streamlit (1.45 or later) come with the base package.
 
 ## A report
 
@@ -420,7 +437,8 @@ cell lists it. A cell that cannot be drawn (no such report, a missing view file)
 drawn. The grid is laid out whole first, each cell's title and an empty slot of the chart's height; the cells'
 queries then run four at a time, and each chart fills its slot as its result comes. On a DuckDB file they run
 one at a time, as every statement of the app does: the connections one process opens to a file share its
-`memory_limit`, which four heavy statements at once can run out of where each alone spills to disk. A period ends when the dashboard is shown; custom dates are not saved, so a cell saved with them opens on
+`memory_limit`, which four heavy statements at once can run out of where each alone spills to disk. When the page
+reruns (a widget changed), the queries still waiting for their turn are dropped; one already running ends. A period ends when the dashboard is shown; custom dates are not saved, so a cell saved with them opens on
 the report's default period. The *Open on the Reports page* icon (↗) of each cell opens its view on the *Reports* page.
 
 Two icons on the title line. *Make a dashboard* (+) takes a name, the charts per row and saved view files, in
@@ -446,8 +464,8 @@ connection (password hidden), the SQL and its binds, then the rows and the time;
 A run that fails (a missing database, a lock, a SQL error) shows the database's message and its run id in place
 of the result, not a traceback.
 
-In advanced mode, the *SQL* expander under a result shows its run id. A result read from the 10-minute cache
-shows the id of the run that produced it.
+In advanced mode, the *SQL* expander under a result shows its run id. A result read from the cache (see
+`--cache-ttl`) shows the id of the run that produced it.
 
 ```text
 2026-10-02 11:14:06,780 INFO yamlboard run 1293ca53-… on duckdb:///:memory:
@@ -551,7 +569,7 @@ For a production bug, when the log platform samples or drops the INFO lines: pul
 from the VMs, once, and analyse them here.
 
 ```bash
-pip install 'yamlboard[ssh]'                       # paramiko
+pip install "yamlboard[ssh] @ git+https://github.com/JeanMichelDurand/yamlboard@v1.1.0"   # paramiko
 yamlboard fetch vm1 vm2 --path /var/log/myapp --pattern 'app.log*' \
     --from '2026-10-08 13:00' --to '2026-10-08 15:00' --dry-run     # what would be read: nothing pulled
 yamlboard fetch vm1 vm2 --path /var/log/myapp --pattern 'app.log*' --from '2026-10-08 13:00' --to '2026-10-08 15:00'
@@ -592,7 +610,8 @@ yamlboard dev --file '~/yamlboard-cases/20261009-1012-vm1/*/*.log.gz'   # the co
 `yamlboard lite DIR` writes the dev app's file side as a static site, for local log and data analysis with
 nothing to install: open the page, drop a file in. It runs on [stlite](https://github.com/whitphx/stlite)
 (Streamlit on Pyodide) and DuckDB-WASM, entirely in the browser tab, so **the file never leaves the machine**.
-The `lite` workflow publishes it on GitHub Pages; locally, `python -m http.server -d DIR` serves it (a browser
+The `lite` workflow publishes it on GitHub Pages at each push to `main`:
+**<https://jeanmicheldurand.github.io/yamlboard/>**. Locally, `python -m http.server -d DIR` serves it (a browser
 will not run it from `file://`).
 
 It has the same *File*, *Query* and *Report* tabs, on CSV, JSON, Parquet, logs and DuckDB database files (a
@@ -641,8 +660,16 @@ print(discover.to_yaml(discover.draft_report(sql, discover.preview(engine, sql),
 ```bash
 uv run pytest                                              # DuckDB only (a temporary .duckdb file), no server
 YAMLBOARD_TEST_PG_URL=postgresql+psycopg://user:pw@localhost/db uv run pytest tests/test_postgres.py
+uvx ruff@0.16.10 check src tests                           # the lint CI runs (settings in pyproject.toml)
 ```
+
+CI (`tests`) runs the lint and the tests on Python 3.10 and 3.13 for every push and pull request.
+
+**A release**: set `version` in `pyproject.toml` and `__version__` in `src/yamlboard/__init__.py`, `uv lock`, commit
+on `main`, then push a tag `v<version>`. The `release` workflow checks the tag against the version, builds the wheel
+and the sdist and makes the [GitHub release](https://github.com/JeanMichelDurand/yamlboard/releases) with notes
+from the merged pull requests.
 
 ## License
 
-MIT
+MIT: see [LICENSE](LICENSE).
