@@ -1,5 +1,10 @@
 # yamlboard
 
+[![tests](https://github.com/JeanMichelDurand/yamlboard/actions/workflows/ci.yml/badge.svg)](https://github.com/JeanMichelDurand/yamlboard/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/JeanMichelDurand/yamlboard)](https://github.com/JeanMichelDurand/yamlboard/releases/latest)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://github.com/JeanMichelDurand/yamlboard/blob/main/pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/JeanMichelDurand/yamlboard/blob/main/LICENSE)
+
 Declare a SQL report in a YAML file; get a chart and a table you can filter and aggregate,
 on the fields the report allows, and nothing else.
 
