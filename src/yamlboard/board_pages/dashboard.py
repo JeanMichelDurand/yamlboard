@@ -1,19 +1,32 @@
-"""The Dashboards page: a grid of charts, each a report seen through a saved view (see ``dashboards.py``)."""
+"""The Dashboards page: a grid of charts, each a report seen through a saved view (see ``dashboards.py``).
+
+The grid is drawn whole first, each cell's title and a slot of the chart's height; the cells' queries then run
+side by side (a DuckDB file's one at a time, see ``engine.run``), and each chart fills its slot as its result
+comes. Drawn cell after cell, the page grew one chart at a time, each waiting for the queries above it.
+"""
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Any
+
 import pandas as pd
 import streamlit as st
+from streamlit.delta_generator import DeltaGenerator
+from streamlit.runtime.scriptrunner import ScriptRunContext, add_script_run_ctx, get_script_run_ctx
 
-from yamlboard import charts, dashboards, settings
+from yamlboard import charts, dashboards, settings, times
 from yamlboard import query as q
 from yamlboard.board import REPORT_PAGE, dashboards_dir, db_error, fetch, resolved_columns, shown_errors, workspace
 from yamlboard.charts import measure_label
-from yamlboard.dashboards import Cell, Dashboard, DashboardError
-from yamlboard.engine import DB_ERRORS, dialect_of, engine_for
+from yamlboard.dashboards import Cell, Dashboard, DashboardError, Plan
+from yamlboard.engine import DB_ERRORS, abandoned_when, dialect_of, engine_for
 from yamlboard.schema import Report
 
 UPLOADED = "\0opened"  # the option of a dashboard opened from the reader's disk; no file is named so
+WORKERS = 4  # the cells' queries running at once; a DuckDB file's still run one at a time (engine.run)
 
 ws = workspace()
 found, errors = dashboards.load_dir(dashboards_dir())
@@ -104,26 +117,40 @@ def open_in_board(report: Report, keys: dict) -> None:
     st.switch_page(REPORT_PAGE)
 
 
-def draw(cell: Cell, i: int) -> None:
-    """One cell: its title, its chart and what of its view was skipped; an error in it stays in it."""
+@dataclass(frozen=True)
+class Pending:
+    """A cell drawn but for its chart: the slot the chart goes in, and what its query needs."""
+
+    slot: DeltaGenerator
+    report: Report
+    plan: Plan
+    params: dict[str, Any]
+    url: str
+
+
+def frame(cell: Cell, i: int) -> Pending | None:
+    """One cell's title, what of its view was skipped, and a slot of the chart's height; None when the cell has
+    no chart to wait for (an error in it stays in it)."""
     report = ws.reports.get(cell.report or "")
     if cell.error or report is None or not report.active:
         st.markdown(f"**{cell.title or cell.report or 'Cell'}**")
         st.warning(cell.error or f"No report {cell.report!r}.", icon=":material/warning:")
-        return
+        return None
     plan = dashboards.plan(cell, report)
     try:
         params = q.coerce_parameters(report, plan.raw_params)
     except q.InvalidParameters as e:
         st.markdown(f"**{cell.title or report.title}**")
         st.error("\n".join(f"- {p}" for p in e.problems), icon=":material/error:")
-        return
+        return None
     plan = dashboards.with_grains(plan, report, params)
 
     header = st.container(horizontal=True, vertical_alignment="center", horizontal_alignment="distribute")
     text = header.container(gap=None)
     text.markdown(f"**{cell.title or report.title}**")
-    text.caption(" · ".join(x for x in (dashboards.chart_title(plan, report), plan.period) if x))
+    day = times.frozen()
+    period = f"{plan.period} to {day}" if plan.period and day else plan.period
+    text.caption(" · ".join(x for x in (dashboards.chart_title(plan, report), period) if x))
     icons = header.container(horizontal=True, width="content", gap="small")
     if plan.skipped:
         icons.badge(f"{len(plan.skipped)} skipped", icon=":material/warning:", color="orange",
@@ -131,10 +158,28 @@ def draw(cell: Cell, i: int) -> None:
     if icons.button(":material/open_in_new:", key=f"dashboard:{i}:open", type="tertiary",
                     help="Open this view on the Reports page"):
         open_in_board(report, plan.keys)
+    slot = st.empty()
+    slot.container(height=dashboard.height, border=False).caption(":material/hourglass_top: Running query…")
+    return Pending(slot, report, plan, params, ws.url(report))
 
-    url = ws.url(report)
+
+def result(p: Pending, ctx: ScriptRunContext | None, gone: threading.Event) -> pd.DataFrame:
+    """The cell's rows: its columns probed, then its query. Runs in a worker thread, given the page's context
+    so that the cache and the session's refresh count are the page's; dropped before it starts once ``gone``."""
+    add_script_run_ctx(threading.current_thread(), ctx)
+    with abandoned_when(gone):
+        cmap = resolved_columns(p.url, p.report.model_dump_json(), p.params)
+        rows, columns = p.plan.groups()
+        stmt = q.aggregate(p.report, dialect_of(engine_for(p.url)), p.params, p.plan.filters, rows, columns,
+                           p.plan.shown, limit=q.MAX_GROUPS + 1, columns_map=cmap)
+        return fetch(p.url, stmt.sql, stmt.binds)
+
+
+def draw(p: Pending, future: Future) -> None:
+    """The cell's chart in its slot, or the error its query met."""
+    report, plan = p.report, p.plan
     try:
-        cmap = resolved_columns(url, report.model_dump_json(), params)
+        df = future.result()
     except q.ColumnMismatch as e:
         st.error(str(e), icon=":material/error:")
         return
@@ -142,32 +187,52 @@ def draw(cell: Cell, i: int) -> None:
         db_error(e)
         return
     rows, columns = plan.groups()
-    stmt = q.aggregate(report, dialect_of(engine_for(url)), params, plan.filters, rows, columns, [plan.measure],
-                       limit=q.MAX_GROUPS + 1, columns_map=cmap)
-    with st.spinner("Running query…"):
-        df = fetch(url, stmt.sql, stmt.binds)
     if len(df) > q.MAX_GROUPS:
         st.caption(f":material/warning: The first {q.MAX_GROUPS:,} groups only.")
     df = df.head(q.MAX_GROUPS)
-    df = df.assign(**{plan.measure.alias: pd.to_numeric(df[plan.measure.alias])})
+    df = df.assign(**{m.alias: pd.to_numeric(df[m.alias]) for m in plan.shown})
     if not rows:
         if columns:
             st.info("This view has no row group: no chart.", icon=":material/bar_chart:")
             return
-        value = df[plan.measure.alias].iloc[0] if len(df) else None
-        st.metric(measure_label(report, plan.measure), "–" if value is None or pd.isna(value) else f"{value:,}",
-                  height=dashboard.height)
+        tiles = st.container(horizontal=True)
+        for m in plan.shown:
+            value = df[m.alias].iloc[0] if len(df) else None
+            tiles.metric(measure_label(report, m), "–" if value is None or pd.isna(value) else f"{value:,}",
+                         height=dashboard.height)
         return
     x, color = rows[0], columns[0] if columns else None
-    dim, _ = charts.legend(df, plan.kind, report, x.field, color and color.field, x.grain, color and color.grain)
-    chart = charts.build(df, plan.kind, report, x.field, plan.measure, color and color.field, x.grain,
-                         color and color.grain, plan.colors.get(dim or charts.SERIES))
+    span = q.timeframe(report, x.field, p.params, plan.filters) if x.grain else None
+    filled = charts.fill(df, plan.kind, report, x.field, plan.shown, color and color.field, x.grain, plan.fmt.empty,
+                         span, trim=plan.fmt.trim_empty)
+    df = df if filled is None else filled
+    dim, _ = charts.legend(df, plan.kind, report, x.field, color and color.field, x.grain, color and color.grain,
+                           plan.shown)
+    chart = charts.build(df, plan.kind, report, x.field, plan.shown, color and color.field, x.grain,
+                         color and color.grain, plan.colors.get(dim or charts.SERIES), fmt=plan.fmt)
     st.altair_chart(chart.properties(height=dashboard.height))
 
 
+pending: list[Pending] = []
 for r, cells in enumerate(dashboards.grid_rows(dashboard.cells, dashboard.columns)):
     used = sum(c.width for c in cells)
     slots = st.columns([c.width for c in cells] + ([dashboard.columns - used] if used < dashboard.columns else []))
     for j, cell in enumerate(cells):
         with slots[j].container(border=True), shown_errors():
-            draw(cell, r * dashboard.columns + j)
+            if (p := frame(cell, r * dashboard.columns + j)) is not None:
+                pending.append(p)
+
+# A rerun stops this script at its next Streamlit call: the queries not started yet are dropped, not waited for,
+# those queued behind a DuckDB file's lock too (`gone`). One already running ends on its own.
+pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="yamlboard-cell")
+gone = threading.Event()
+try:
+    ctx = get_script_run_ctx()
+    futures = {pool.submit(result, p, ctx, gone): p for p in pending}
+    for future in as_completed(futures):
+        p = futures[future]
+        with p.slot.container(), shown_errors():
+            draw(p, future)
+finally:
+    gone.set()
+    pool.shutdown(wait=False, cancel_futures=True)

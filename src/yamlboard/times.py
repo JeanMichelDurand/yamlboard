@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
@@ -27,9 +28,23 @@ class NotISO(ValueError):
     """A string that is not the ISO-8601 date or timestamp expected."""
 
 
+TODAY_VAR = "YAMLBOARD_TODAY"
+
+
+def frozen() -> date | None:
+    """The day the clock is set to (``--today``, ``$YAMLBOARD_TODAY``), for data that stops on a known day, such
+    as an export; None: the real clock. Read on every call, so a test or a run sets it in the environment."""
+    raw = os.environ.get(TODAY_VAR, "").strip()
+    if not raw:
+        return None
+    if not is_day(raw):
+        raise NotISO(f"{TODAY_VAR}: {raw!r} is not a day (YYYY-MM-DD)")
+    return parse_date(raw)
+
+
 def today() -> date:
-    """Today in UTC, whatever the server's zone."""
-    return datetime.now(timezone.utc).date()
+    """Today in UTC, whatever the server's zone; the day the clock is set to, if it is."""
+    return frozen() or datetime.now(timezone.utc).date()
 
 
 def is_day(value: Any) -> bool:
@@ -152,6 +167,39 @@ def period_index(value: datetime, grain: Any) -> int:
     raise ValueError(f"unknown grain {g!r}")
 
 
+def period_start(value: datetime, grain: Any) -> datetime:
+    """The start of the ``grain`` period that holds ``value`` (naive UTC), as ``date_trunc`` gives it: a week starts
+    on Monday (ISO)."""
+    g = getattr(grain, "value", grain)
+    if g == "minute":
+        return value.replace(second=0, microsecond=0)
+    if g == "hour":
+        return value.replace(minute=0, second=0, microsecond=0)
+    day = datetime(value.year, value.month, value.day)
+    if g == "day":
+        return day
+    if g == "week":
+        return day - timedelta(days=value.weekday())
+    if g == "month":
+        return day.replace(day=1)
+    if g == "quarter":
+        return day.replace(month=(value.month - 1) // 3 * 3 + 1, day=1)
+    if g == "year":
+        return day.replace(month=1, day=1)
+    raise ValueError(f"unknown grain {g!r}")
+
+
+_FREQ = {"minute": "min", "hour": "h", "day": "D", "week": "7D", "month": "MS", "quarter": "QS", "year": "YS"}
+
+
+def period_starts(first: datetime, last: datetime, grain: Any) -> list[datetime]:
+    """The start of every ``grain`` period the instants from ``first`` to ``last`` (naive UTC) touch, in order."""
+    g = getattr(grain, "value", grain)
+    if last < first:
+        return []
+    return [t.to_pydatetime() for t in pd.date_range(period_start(first, g), last, freq=_FREQ[g])]
+
+
 def period_count(first: datetime, last: datetime, grain: Any) -> int:
     """How many ``grain`` periods the instants from ``first`` to ``last`` (both included) touch."""
     return period_index(last, grain) - period_index(first, grain) + 1
@@ -180,7 +228,10 @@ DAY_PERIODS = tuple(p for p in PERIODS if p != "last_hour")  # a date parameter 
 
 
 def now() -> datetime:
-    """Now in UTC, naive, to the minute: the queries of one minute share their binds, and their cache."""
+    """Now in UTC, naive, to the minute: the queries of one minute share their binds, and their cache. With the
+    clock set to a day, that day's last minute, the same all day: every period ends then."""
+    if day := frozen():
+        return datetime(day.year, day.month, day.day, 23, 59)
     return datetime.now(timezone.utc).replace(tzinfo=None, second=0, microsecond=0)
 
 

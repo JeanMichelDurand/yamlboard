@@ -1,0 +1,32 @@
+# The Map view: a `map` section names the fields that place a row. The SQL fakes 20,000 energy sites around eight
+# French cities in DuckDB, so the example runs anywhere (the map's background needs the internet, in the browser).
+id: places
+title: Energy sites
+description: Sites by place, gathered by zoom; their installed power
+sql: |
+  select
+    'S' || lpad(cast(i as varchar), 6, '0') as site_id,
+    ['Paris', 'Lyon', 'Marseille', 'Lille', 'Bordeaux', 'Strasbourg', 'Nantes', 'Toulouse'][1 + k] as city,
+    round([48.857, 45.764, 43.296, 50.629, 44.838, 48.573, 47.218, 43.605][1 + k] + spread * (u1 + u2 - 1), 6) as lat,
+    round([2.352, 4.836, 5.370, 3.057, -0.579, 7.752, -1.554, 1.444][1 + k] + 1.4 * spread * (u3 + u4 - 1), 6) as lon,
+    ['Solar', 'Wind', 'Heat pump'][1 + cast(hash(i, 't') % 3 as integer)] as kind,
+    round(5 + (hash(i, 'p') % 1000) / 10.0, 1) as power_kw
+  from (
+    select i, cast(hash(i, 'c') % 8 as integer) as k, case when i % 10 = 0 then 1.2 else 0.15 end as spread,
+           (hash(i, 'a') % 10000) / 10000.0 as u1, (hash(i, 'b') % 10000) / 10000.0 as u2,
+           (hash(i, 'x') % 10000) / 10000.0 as u3, (hash(i, 'y') % 10000) / 10000.0 as u4
+    from range(20000) t(i)
+  )
+result_columns:
+  - {name: site_id, label: Site, filterable: true}
+  - {name: city, label: City, filterable: true, groupable: true}
+  - {name: kind, label: Kind, filterable: true, groupable: true, colors: {Solar: "#EDA100", Wind: "#2A78D6", Heat pump: "#EB6834"}}
+  - {name: lat, label: Latitude, type: number}
+  - {name: lon, label: Longitude, type: number}
+  - {name: power_kw, label: Power (kW), type: number, measures: [sum, avg, max, median]}
+map:
+  lat: lat
+  lon: lon
+  label: site_id
+view:
+  measures: [{field: power_kw, aggregation: sum}]

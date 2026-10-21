@@ -8,6 +8,9 @@ so existing report files load unchanged.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -69,6 +72,8 @@ class ChartType(str, Enum):
     COLUMN_STACKED = "column-stacked"
     BAR = "bar"
     BAR_STACKED = "bar-stacked"
+    COLUMN_PERCENT = "column-percent"
+    BAR_PERCENT = "bar-percent"
     LINE = "line"
     AREA = "area"
     PIE = "pie"
@@ -78,6 +83,44 @@ class ChartType(str, Enum):
     def one_dimension(self) -> bool:
         """Draws one dimension only: its slices are the row groups, never split by a column field."""
         return self in (ChartType.PIE, ChartType.DONUT)
+
+    @property
+    def stacked(self) -> bool:
+        """Stacks the split's values in one column or bar per row group (to 100% for a percent chart)."""
+        return self in (ChartType.COLUMN_STACKED, ChartType.BAR_STACKED, ChartType.COLUMN_PERCENT,
+                        ChartType.BAR_PERCENT)
+
+
+# The charts a measure can have of its own in a combo, beside the view's: one family each, drawn over the same axis.
+SERIES_CHARTS = (ChartType.COLUMN, ChartType.LINE, ChartType.AREA)
+
+
+class Empty(str, Enum):
+    """How a chart shows an empty cell: a period with no rows, a split value missing at a row group (Excel's
+    *Hidden and empty cells*)."""
+
+    GAPS = "gaps"  # nothing drawn, a line breaks
+    ZERO = "zero"  # a count or a sum reads 0 (no rows: nothing counted); an average, a min, a max, a median stays a gap
+    CONNECT = "connect"  # a line joins the points either side
+
+
+class AxisSide(str, Enum):
+    PRIMARY = "primary"
+    SECONDARY = "secondary"
+
+
+class Units(str, Enum):
+    """How a value axis labels its values (Excel's *Display units*): as they are, in thousands (``12.5 k``),
+    millions, billions, or as a percentage of 1 (``0.125`` reads ``12.5%``)."""
+
+    NONE = "none"
+    THOUSANDS = "thousands"
+    MILLIONS = "millions"
+    BILLIONS = "billions"
+    PERCENT = "percent"
+
+
+MAX_DECIMALS = 6  # an axis's or the detail's decimals, at most
 
 
 class Rule(str, Enum):
@@ -104,6 +147,8 @@ _AGG_ALIASES = {"distinctcount": "count_distinct", "average": "avg", "mean": "av
 _CHART_ALIASES = {
     "stacked_column": "column-stacked", "stacked-column": "column-stacked",
     "bar_h": "bar", "stacked_bar": "bar-stacked", "stacked-bar": "bar-stacked",
+    "column-100": "column-percent", "column_percent": "column-percent", "bar-100": "bar-percent",
+    "bar_percent": "bar-percent",
 }
 _RULE_ALIASES = {"day_between": "max_days", "hour_between": "max_hours"}
 
@@ -283,13 +328,74 @@ class ParamRule(_Model):
 
 
 class MeasureDef(_Model):
+    """A measure of the view; ``chart`` and ``axis`` place it in a chart of several measures (a combo)."""
+
     field: str = F("*", validation_alias=AliasChoices("field", "uniqueName"))
     aggregation: Aggregation = Aggregation.COUNT
+    chart: ChartType | None = None  # column, line or area; None: the view's chart
+    axis: AxisSide = AxisSide.PRIMARY
 
     @field_validator("aggregation", mode="before")
     @classmethod
     def _agg(cls, v: Any) -> Any:
         return _normalise(v, _AGG_ALIASES)
+
+    @field_validator("chart", mode="before")
+    @classmethod
+    def _chart(cls, v: Any) -> Any:
+        return _normalise(v, _CHART_ALIASES)
+
+    @field_validator("chart")
+    @classmethod
+    def _series_chart(cls, v: ChartType | None) -> ChartType | None:
+        if v is not None and v not in SERIES_CHARTS:
+            raise ValueError(f"a measure's own chart is one of {', '.join(c.value for c in SERIES_CHARTS)}, not {v.value}")
+        return v
+
+    @field_validator("axis", mode="before")
+    @classmethod
+    def _axis(cls, v: Any) -> Any:
+        return _normalise(v, {}) or AxisSide.PRIMARY
+
+
+class AxisDef(_Model):
+    """A value axis's format (Excel's *Format axis*): its bounds (raw values; none: from the data), a log scale, its
+    labels' units, decimals (none: as the axis picks), and a text before and after them (``$``, `` €``)."""
+
+    min: float | None = None
+    max: float | None = None
+    log: bool = False
+    units: Units = Units.NONE
+    decimals: int | None = F(None, ge=0, le=MAX_DECIMALS)
+    prefix: str = F("", max_length=8)
+    suffix: str = F("", max_length=8)
+
+    @field_validator("units", mode="before")
+    @classmethod
+    def _units(cls, v: Any) -> Any:
+        return _normalise(v, {}) or Units.NONE
+
+    @model_validator(mode="after")
+    def _bounds(self) -> AxisDef:
+        if self.min is not None and self.max is not None and self.min >= self.max:
+            raise ValueError(f"the axis's min ({self.min:g}) is not below its max ({self.max:g})")
+        if self.log and ((self.min is not None and self.min <= 0) or (self.max is not None and self.max <= 0)):
+            raise ValueError("a log scale's bounds are above zero")
+        return self
+
+
+class ViewFilter(_Model):
+    """A filter the view opens with: ``{field: region, op: in, values: [North]}``. The operators are
+    ``query.OPS``; dates as ISO text or YAML dates."""
+
+    field: str
+    op: str = "in"
+    values: tuple[Any, ...] = ()
+
+    @field_validator("values", mode="before")
+    @classmethod
+    def _values(cls, v: Any) -> Any:
+        return () if v is None else v if isinstance(v, list | tuple) else (v,)
 
 
 class View(_Model):
@@ -301,6 +407,11 @@ class View(_Model):
     chart: ChartType = ChartType.COLUMN
     grains: dict[str, Grain] = {}
     color: str | None = None  # the colour of a chart with one series (no split)
+    filters: tuple[ViewFilter, ...] = ()
+    hide_partial: bool = False  # leave out the periods the result holds only part of
+    empty: Empty = Empty.GAPS  # how the chart shows an empty cell
+    trim_empty: bool = False  # the time axis runs from the first period with data to the last, not the range's
+    axes: dict[AxisSide, AxisDef] = {}  # the format of each value axis
 
     @field_validator("rows", "columns", mode="before")
     @classmethod
@@ -321,6 +432,76 @@ class View(_Model):
     @classmethod
     def _color(cls, v: Any) -> Any:
         return None if v is None else color_hex(v)
+
+    @field_validator("empty", mode="before")
+    @classmethod
+    def _empty(cls, v: Any) -> Any:
+        return _normalise(v, {}) or Empty.GAPS
+
+    @field_validator("axes", mode="before")
+    @classmethod
+    def _axes(cls, v: Any) -> Any:
+        return {_normalise(k, {}): a for k, a in v.items()} if isinstance(v, dict) else v or {}
+
+    def chart_format(self) -> ChartFormat:
+        """The format the view's chart opens with."""
+        from yamlboard.query import Measure  # query imports this module
+
+        return ChartFormat(self.empty, {Measure(m.field, m.aggregation).alias: Series(m.chart, m.axis)
+                                        for m in self.measures}, dict(self.axes), self.trim_empty)
+
+
+class MapDef(_Model):
+    """Where a row is, for the Map view: its ``lat`` and ``lon`` fields (WGS84 degrees), and a ``label`` field a
+    single point shows. ``tiles``: the background's raster tiles (``{z}/{x}/{y}``), with their ``attribution``.
+
+    The default, OpenStreetMap's own tiles, is for light use (its tile usage policy): a board many people read sets
+    a tile service of its own. CARTO's free basemaps now need an API key."""
+
+    lat: str
+    lon: str
+    label: str | None = None
+    tiles: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    attribution: str = "© OpenStreetMap contributors"
+
+    @field_validator("tiles")
+    @classmethod
+    def _tiles(cls, v: str) -> str:
+        if not re.match(r"https?://", v) or not all(p in v for p in ("{z}", "{x}", "{y}")):
+            raise ValueError(f"tiles: an http(s) URL with {{z}}, {{x}} and {{y}}, not {v!r}")
+        return v
+
+
+@dataclass(frozen=True)
+class Series:
+    """A measure in a chart of several: its own chart (column, line or area; None: the chart's) and its axis."""
+
+    chart: ChartType | None = None
+    axis: AxisSide = AxisSide.PRIMARY
+
+
+@dataclass(frozen=True)
+class ChartFormat:
+    """A chart's format (Excel's *Format* pane): how it shows ``empty`` cells; in a chart of several measures, each
+    one's ``series`` (by measure alias); each value axis's ``axes`` format; ``trim_empty``: the time axis runs over
+    the data's periods only, without the empty ones before the first and after the last. What is not given is the
+    default: gaps, the chart's own mark, the primary axis, axes from the data, the whole range."""
+
+    empty: Empty = Empty.GAPS
+    series: Mapping[str, Series] = dc_field(default_factory=dict)
+    axes: Mapping[AxisSide, AxisDef] = dc_field(default_factory=dict)
+    trim_empty: bool = False
+
+    def chart_of(self, alias: str) -> ChartType | None:
+        s = self.series.get(alias)
+        return s.chart if s else None
+
+    def axis_of(self, alias: str) -> AxisSide:
+        s = self.series.get(alias)
+        return s.axis if s else AxisSide.PRIMARY
+
+    def axis(self, side: AxisSide) -> AxisDef:
+        return self.axes.get(side) or AxisDef()
 
 
 # A ``:name`` bind, as SQLAlchemy reads it: not a ``::type`` cast, and not ``:name::type`` either
@@ -347,6 +528,7 @@ class Report(_Model):
     # The columns of the SQL result and what users may do with each. ``fields`` is the older name.
     fields: tuple[FieldDef, ...] = F(validation_alias=AliasChoices("result_columns", "fields"))
     view: View = View()
+    map: MapDef | None = None  # the fields that place a row on a map: the Map view
     rights: tuple[str, ...] = F((), validation_alias=AliasChoices("rights", "right"))  # parsed, not enforced yet
     formats: tuple[str, ...] = ()
     readme: str = ""
@@ -401,6 +583,23 @@ class Report(_Model):
                     problems.append(f"view.measures: '*' only supports count, not {m.aggregation.value}")
             elif m.field not in fields or m.aggregation not in fields[m.field].measures:
                 problems.append(f"view.measures: {m.aggregation.value} of {m.field!r} is not allowed by the field")
+
+        if self.map:
+            for role in ("lat", "lon"):
+                name = getattr(self.map, role)
+                if name not in fields or not fields[name].type.numeric:
+                    problems.append(f"map.{role}: {name!r} is not a number field")
+            if self.map.label and self.map.label not in fields:
+                problems.append(f"map.label: {self.map.label!r} is not a field")
+
+        if not problems:  # the filter checks read the fields: only once they are sound
+            from yamlboard.query import Filter, NotAllowed, _check_filter  # query imports this module
+
+            for vf in self.view.filters:
+                try:
+                    _check_filter(self, Filter(vf.field, vf.op, vf.values))
+                except NotAllowed as e:
+                    problems.append(f"view.filters: {e}")
 
         params = {p.name for p in self.parameters}
         applied: set[str] = set()

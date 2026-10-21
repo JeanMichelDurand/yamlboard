@@ -6,7 +6,7 @@
       "chart": "column-stacked",
       "row": "order_date",
       "column": "region",
-      "measure": "sum_amount",
+      "measures": ["sum_amount"],
       "grains": {"order_date": "month"},
       "colors": {"region": {"North": "#d00000"}},
       "periods": {"start": "last_year"}

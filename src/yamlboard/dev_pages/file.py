@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from yamlboard import dev_state, discover, files
+from yamlboard import board, dev_state, discover, files
 from yamlboard.engine import engine_for, run
 from yamlboard.query import Statement
 from yamlboard.schema import FieldType
@@ -16,9 +16,23 @@ fmt: files.Format = state.file["format"]
 engine = engine_for(files.MEMORY_URL)
 
 
-@st.cache_data(ttl=60, max_entries=32, show_spinner="Reading the file…")
-def fetch(sql: str) -> pd.DataFrame:
+FILE_CACHE_TTL = 60
+
+
+def _read(sql: str) -> pd.DataFrame:
     return run(engine_for(files.MEMORY_URL), Statement(sql, {}))
+
+
+def _cached(sql: str, slot: tuple[int, int]) -> pd.DataFrame:
+    return _read(sql)
+
+
+def fetch(sql: str) -> pd.DataFrame:
+    """Cached for ``--cache-ttl`` seconds (60 by default): a log being pulled with ``fetch --follow`` grows."""
+    slot = board.cache_key(FILE_CACHE_TTL)
+    if slot is None:
+        return _read(sql)
+    return board.cached(_cached, board.cache_ttl(FILE_CACHE_TTL), 32, "Reading the file…")(sql, slot)
 
 
 def query_this(sql: str) -> None:
@@ -62,7 +76,10 @@ pattern = st.text_input(
 )
 if known and known.note:
     st.caption(known.note)
-st.caption("A line that does not match is left out: a multi-line entry keeps its first line only.")
+multiline = st.toggle(
+    "Stack traces", key="log_multiline",
+    help="A line that does not match continues the entry above it: kept in a `trace` column instead of left out. "
+         "Off, a multi-line entry keeps its first line only.")
 
 try:
     names = [n for n in files.groups(pattern) if n]
@@ -85,7 +102,11 @@ edited = st.data_editor(
 )
 columns = {r.column: files.Column(r.column, FieldType(r.type), (r.format or "").strip() or None)
            for r in edited.itertuples() if r.type in types}
-sql = files.log_sql(path, pattern, columns)
+try:
+    sql = files.log_sql(path, pattern, columns, multiline)
+except ValueError as e:
+    st.error(str(e), icon=":material/error:")
+    st.stop()
 
 try:
     counts = fetch(files.match_sql(path, pattern)).iloc[0]

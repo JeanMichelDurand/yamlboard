@@ -5,7 +5,7 @@
   "grid": {"columns": 2, "height": 300},
   "cells": [
     {"view": "views/sales-by-region.json"},
-    {"report": "sales", "title": "Orders by product", "view": {"chart": "donut", "row": "product", "measure": "count"}},
+    {"report": "sales", "title": "Orders by product", "view": {"chart": "donut", "row": "product", "measures": ["count"]}},
     {"report": "ash-activity", "title": "Database activity by wait class", "width": 2}
   ]
 }

@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -86,8 +87,8 @@ def test_cells_fill_the_grid_row_by_row():
 def test_the_plan_takes_the_view_over_the_report(reports):
     cell = dashboards.load_dir(DASHBOARDS)[0][0].cells[0]
     p = dashboards.plan(cell, reports["sales"])
-    assert (p.kind, p.row, p.column, p.measure.alias) == (ChartType.COLUMN_STACKED, "order_date", "region",
-                                                          "sum_amount")
+    assert (p.kind, p.row, p.column, [m.alias for m in p.measures]) == (ChartType.COLUMN_STACKED, "order_date",
+                                                                         "region", ["sum_amount"])
     assert p.grains == {"order_date": Grain.MONTH} and p.colors == {"region": {"North": "#d00000"}}
     assert p.period == "Last year" and p.skipped == []
     assert p.keys["sales:chart"] is ChartType.COLUMN_STACKED                  # to open it on the Reports page
@@ -115,6 +116,15 @@ def test_the_grain_follows_the_period_when_the_view_sets_none(reports):
     from yamlboard import query as q
     params = q.coerce_parameters(r, p.raw_params)
     assert dashboards.with_grains(p, r, params).grains == {"order_date": Grain.DAY}
+
+
+def test_the_clock_set_to_a_day_ends_the_period_on_it(reports, monkeypatch):
+    from yamlboard import times
+
+    monkeypatch.setenv(times.TODAY_VAR, "2026-08-17")
+    p = dashboards.plan(Cell("sales", view={"periods": {"start": "last_3_months"}}), reports["sales"])
+    assert (p.raw_params["start"], p.raw_params["end"]) == (date(2026, 5, 17), date(2026, 8, 17))
+    assert p.period == "Last 3 months"
 
 
 def test_a_dashboard_made_from_saved_views():
@@ -152,6 +162,33 @@ def test_the_dashboard_page_draws_every_cell(board):
     scale = specs[0]["encoding"]["color"]["scale"]
     assert scale["range"][scale["domain"].index("North")] == "#d00000"        # the view's colour
     assert all(s["height"] == 300 for s in specs)
+
+
+def test_the_cells_queries_run_side_by_side(board, monkeypatch):
+    """Each query waits until all three cells' are running: one after the other, the first would never return."""
+    import threading
+
+    from yamlboard import board as yb
+
+    real, ready = yb.fetch, threading.Barrier(3, timeout=10)
+
+    def together(*args):
+        ready.wait()
+        return real(*args)
+
+    monkeypatch.setattr(yb, "fetch", together)
+    board.run()
+    assert not board.exception and not board.error
+    assert len(charts_of(board)) == 3
+
+
+def test_the_captions_say_when_the_clock_is_set(board, monkeypatch):
+    from yamlboard import times
+
+    monkeypatch.setenv(times.TODAY_VAR, "2026-08-17")
+    board.run()
+    assert not board.exception
+    assert any("Last year to 2026-08-17" in c.value for c in board.caption)
 
 
 def test_a_cell_opens_its_view_on_the_reports_page(board):

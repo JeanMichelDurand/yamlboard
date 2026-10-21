@@ -9,9 +9,10 @@ real column names, ``resolve_columns`` maps each field onto one, and the builder
 that exact name. Output columns always carry the field name as written in the YAML.
 
 Filters combine the same way everywhere: filters on different fields must all match; on one
-field, the inclusions (``in``, ``between``, ``is_null``) are alternatives and the exclusions
-(``not_in``, ``not_between``, ``not_null``) all apply. An exclusion keeps NULL rows unless NULL
-is one of its values or ``not_null`` is set.
+field, the inclusions (``in``, ``between``, ``is_null``, ``contains``) are alternatives and the exclusions
+(``not_in``, ``not_between``, ``not_null``, ``not_contains``) all apply. An exclusion keeps NULL rows unless NULL
+is one of its values or ``not_null`` is set. ``contains`` matches a text field's values holding a text, ignoring
+case.
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from typing import Any
+
+import pandas as pd
 
 from yamlboard import times
 from yamlboard.dialects import Dialect
@@ -45,8 +48,8 @@ class InvalidParameters(ValueError):
         self.problems = problems
 
 
-OPS = ("in", "not_in", "between", "not_between", "is_null", "not_null")
-NEGATED = {"not_in": "in", "not_between": "between", "not_null": "is_null"}
+OPS = ("in", "not_in", "between", "not_between", "is_null", "not_null", "contains", "not_contains")
+NEGATED = {"not_in": "in", "not_between": "between", "not_null": "is_null", "not_contains": "contains"}
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,60 @@ def coerce_value(ftype: FieldType, value: Any, field: str) -> Any:
         return coerce(ftype, value)
     except (TypeError, ValueError):
         raise NotAllowed(f"{value!r} is not a valid {ftype.value} for {field!r}") from None
+
+
+def search_filter(field: FieldDef, text: str) -> Filter:
+    """The filter a search typed on ``field`` means: a text field's values containing it; on a number or a date,
+    the value (a date: that whole day), or a range: ``a..b``, ``>=a``, ``<=b``, bounds included. A number may
+    hold spaces between its thousands and a decimal comma (``1 234,5``). Refused if it does not fit the field."""
+    text = text.strip()
+    if field.type is FieldType.STRING:
+        return Filter(field.name, "contains", (text,))
+
+    def value(t: str) -> Any:
+        t = t.strip()
+        if field.type.numeric:
+            t = re.sub(r"[\s\u202f\u00a0]", "", t)
+            t = t.replace(",", ".") if "." not in t else t
+        if field.type is FieldType.TIMESTAMP:  # a day, the whole of it: see _between
+            return coerce_value(FieldType.DATE, t, field.name)
+        return coerce_value(field.type, t, field.name)
+
+    if field.type is FieldType.BOOLEAN or not text:
+        return Filter(field.name, "in", (value(text),))
+    if ".." in text:
+        lo, hi = text.split("..", 1)
+        return Filter(field.name, "between", (value(lo) if lo.strip() else None, value(hi) if hi.strip() else None))
+    if text.startswith(">="):
+        return Filter(field.name, "between", (value(text[2:]), None))
+    if text.startswith("<="):
+        return Filter(field.name, "between", (None, value(text[2:])))
+    v = value(text)
+    return Filter(field.name, "between", (v, v)) if field.type.temporal else Filter(field.name, "in", (v,))
+
+
+PERIODS = {Grain.MINUTE: pd.Timedelta(minutes=1), Grain.HOUR: pd.Timedelta(hours=1), Grain.DAY: pd.Timedelta(days=1),
+           Grain.WEEK: pd.Timedelta(days=7), Grain.MONTH: pd.DateOffset(months=1),
+           Grain.QUARTER: pd.DateOffset(months=3), Grain.YEAR: pd.DateOffset(years=1)}
+
+
+def pick_filter(field: FieldDef, value: Any, grain: Grain | None = None) -> Filter:
+    """The filter a click on a chart means: its value, empty values for None, or the whole period that starts at
+    ``value`` when the date field is grouped by ``grain`` (a month: its first to its last day)."""
+    if value is None:
+        return Filter(field.name, "is_null")
+    if not field.type.temporal:
+        return Filter(field.name, "in", (value,))
+    start = pd.Timestamp(value)
+    start = start.tz_convert("UTC").tz_localize(None) if start.tzinfo else start  # naive UTC, as the queries bind
+    if grain is None:
+        return Filter(field.name, "in", (start.to_pydatetime(),))
+    end = start + PERIODS[grain]
+    if grain in (Grain.MINUTE, Grain.HOUR):  # a timestamp's own bounds, the last microsecond of the period
+        last = end - pd.Timedelta(microseconds=1)
+        return Filter(field.name, "between", (start.to_pydatetime(), last.to_pydatetime()))
+    # Whole days: a timestamp field keeps the whole of its last one (see _between).
+    return Filter(field.name, "between", (start.date(), (end - pd.Timedelta(days=1)).date()))
 
 
 def coerce_parameters(report: Report, raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -216,6 +273,11 @@ def _check_filter(report: Report, f: Filter) -> FieldDef:
     if NEGATED.get(f.op, f.op) == "is_null":
         if f.values:
             raise NotAllowed(f"{f.op} on {field.name!r} takes no value, got {len(f.values)}")
+    elif NEGATED.get(f.op, f.op) == "contains":
+        if field.type is not FieldType.STRING:
+            raise NotAllowed(f"{f.op} needs a text field, {field.name!r} is {field.type.value}")
+        if len(f.values) != 1 or not isinstance(f.values[0], str) or not f.values[0]:
+            raise NotAllowed(f"{f.op} on {field.name!r} takes one non-empty text")
     elif NEGATED.get(f.op, f.op) == "between":
         if len(f.values) != 2:
             raise NotAllowed(f"{f.op} on {field.name!r} takes 2 values, got {len(f.values)}")
@@ -312,13 +374,22 @@ class _Builder:
                 raise NotAllowed(f"at most {MAX_IN_VALUES} values in one filter on {field.name!r}")
         alternatives = [self._in(field, include_values, negate=False)] if include_values else []
         alternatives += [self._between(field, *f.values, negate=False) for f in filters if f.op == "between"]
+        alternatives += [self._contains(field, f.values[0], negate=False) for f in filters if f.op == "contains"]
         clauses = []
         if alternatives:
             clauses.append(alternatives[0] if len(alternatives) == 1 else "(" + " OR ".join(alternatives) + ")")
         if exclude_values:
             clauses.append(self._in(field, exclude_values, negate=True))
         clauses += [self._between(field, *f.values, negate=True) for f in filters if f.op == "not_between"]
+        clauses += [self._contains(field, f.values[0], negate=True) for f in filters if f.op == "not_contains"]
         return clauses
+
+    def _contains(self, field: FieldDef, text: str, negate: bool) -> str:
+        """The values holding ``text``, ignoring case; its ``%`` and ``_`` are plain characters. Negated, NULL rows
+        are kept, as by every exclusion."""
+        pattern = "%" + re.sub(r"([\\%_])", r"\\\1", text) + "%"
+        match = self.d.contains(self.col(field.name), self.bind(pattern))
+        return f"({self.col(field.name)} IS NULL OR NOT {match})" if negate else match
 
     def _in(self, field: FieldDef, raw: Sequence[Any], negate: bool) -> str:
         col = self.col(field.name)
@@ -406,6 +477,26 @@ def aggregate(
     return Statement("\n".join(s for s in sql if s), b.binds)
 
 
+def extents(
+    report: Report,
+    dialect: Dialect,
+    params: Mapping[str, Any],
+    group: Group,
+    filters: Sequence[Filter] = (),
+    columns_map: Mapping[str, str] | None = None,
+) -> Statement:
+    """The first and last value of a date field in each of its ``group`` periods: ``yb_start``, ``yb_lo``,
+    ``yb_hi``, one row per period. What ``complete_periods`` reads to tell a period the data covers in part."""
+    field = _check_group(report, group, "rows" if _field(report, group.field).groupable_rows else "columns")
+    if not field.type.temporal or group.grain is None:
+        raise NotAllowed(f"{group.field!r} by a grain is not a date period")
+    b = _Builder(report, dialect, params, columns_map)
+    key, col = b.group_expr(group), b.col(field.name)
+    sql = [f"SELECT {key} AS yb_start, min({col}) AS yb_lo, max({col}) AS yb_hi", b.source(), b.where(filters),
+           f"GROUP BY {key}", f"ORDER BY {key}", dialect.limit(MAX_GROUPS + 1)]
+    return Statement("\n".join(s for s in sql if s), b.binds)
+
+
 def detail(
     report: Report,
     dialect: Dialect,
@@ -416,15 +507,20 @@ def detail(
     limit: int = 100,
     offset: int = 0,
     columns_map: Mapping[str, str] | None = None,
+    order: Sequence[tuple[str, bool]] = (),
 ) -> Statement:
-    """The report's rows, filtered, one page at a time."""
+    """The report's rows, filtered, one page at a time, sorted by ``order``: (field, descending) pairs, the first
+    one first. ``order_by`` and ``descending``: a single sort key, as before ``order``."""
     if not 0 < limit <= MAX_PAGE or offset < 0:
         raise NotAllowed(f"limit must be between 1 and {MAX_PAGE}, offset not negative")
     b = _Builder(report, dialect, params, columns_map)
     cols = ", ".join(f"{b.col(name)} AS {dialect.quote(name)}" for name in report.field_map)
     sql = [f"SELECT {cols}", b.source(), b.where(filters)]
-    if order_by:
-        sql.append(f"ORDER BY {b.col(_field(report, order_by).name)} {'DESC' if descending else 'ASC'}")
+    keys = [(order_by, descending)] if order_by else []
+    keys += [(f, d) for f, d in order if f != order_by]
+    if keys:
+        sql.append("ORDER BY " + ", ".join(f"{b.col(_field(report, f).name)} {'DESC' if d else 'ASC'}"
+                                           for f, d in keys))
     sql.append(dialect.limit(limit, offset))
     return Statement("\n".join(s for s in sql if s), b.binds)
 
@@ -459,6 +555,99 @@ def distinct_values(
     return Statement("\n".join(s for s in sql if s), b.binds)
 
 
+# --- map -------------------------------------------------------------------------
+
+# The map's grid: cell sizes in degrees, finest first. The finest (about 10 cm) keeps every distinct place.
+GRID = (0.000001, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0)
+MAX_CELLS = 50_000  # the cells sent to the browser at most, which clusters them by zoom
+# A cluster of cells combines their measures: so can a count, a sum, a min, a max, and an average carried as a sum
+# and a count. A distinct count or a median of cells is not the one of their rows.
+MAP_AGGREGATIONS = (Aggregation.COUNT, Aggregation.SUM, Aggregation.AVG, Aggregation.MIN, Aggregation.MAX)
+
+
+def _map_fields(report: Report) -> tuple[str, str]:
+    if report.map is None:
+        raise NotAllowed(f"report {report.id!r} has no map")
+    return report.map.lat, report.map.lon
+
+
+def _cell_key(b: _Builder, lat: str, lon: str, size: float) -> tuple[str, str]:
+    """A cell's row and column on the grid of ``size`` degrees: integers (sizes are constants, never data)."""
+    return (f"CAST(floor({b.col(lat)} / {size!r}) AS BIGINT)", f"CAST(floor({b.col(lon)} / {size!r}) AS BIGINT)")
+
+
+def _placed(b: _Builder, report: Report, filters: Sequence[Filter]) -> str:
+    """The filters' WHERE, and only the rows with a place."""
+    lat, lon = _map_fields(report)
+    where = b.where(filters)
+    placed = f"{b.col(lat)} IS NOT NULL AND {b.col(lon)} IS NOT NULL"
+    return f"{where}\n  AND {placed}" if where else f"WHERE {placed}"
+
+
+def map_levels(
+    report: Report,
+    dialect: Dialect,
+    params: Mapping[str, Any],
+    filters: Sequence[Filter] = (),
+    columns_map: Mapping[str, str] | None = None,
+) -> Statement:
+    """How many cells each grid of ``GRID`` holds: one row, ``yb_0``, ``yb_1``... What ``map_grid`` picks from."""
+    lat, lon = _map_fields(report)
+    b = _Builder(report, dialect, params, columns_map)
+    counts = []
+    for i, size in enumerate(GRID):
+        y, x = _cell_key(b, lat, lon, size)
+        # One number per cell: a row index times more columns than the grid has (360 / 1e-6 < 1e9).
+        counts.append(f"count(DISTINCT {y} * 1000000000 + {x}) AS yb_{i}")
+    sql = [f"SELECT {', '.join(counts)}", b.source(), _placed(b, report, filters)]
+    return Statement("\n".join(s for s in sql if s), b.binds)
+
+
+def map_grid(levels: Mapping[str, Any]) -> float:
+    """The finest grid of ``GRID`` with at most ``MAX_CELLS`` cells, by ``map_levels``' row; the coarsest if none."""
+    for i, size in enumerate(GRID):
+        if int(levels.get(f"yb_{i}") or 0) <= MAX_CELLS:
+            return size
+    return GRID[-1]
+
+
+def map_cells(
+    report: Report,
+    dialect: Dialect,
+    params: Mapping[str, Any],
+    size: float,
+    filters: Sequence[Filter] = (),
+    measure: Measure | None = None,
+    columns_map: Mapping[str, str] | None = None,
+) -> Statement:
+    """One row per cell of the grid of ``size`` degrees: ``yb_lat``, ``yb_lon`` (the mean place of its rows),
+    ``yb_n`` (its rows), the measure's parts (``yb_s`` sum and ``yb_c`` count, ``yb_min``, ``yb_max``: what a
+    cluster of cells adds up) and ``yb_label`` (the label of a cell of one row)."""
+    lat, lon = _map_fields(report)
+    measure = measure or Measure()
+    if size not in GRID:
+        raise NotAllowed(f"{size!r} is not a grid size of the map")
+    _check_measure(report, measure)
+    if measure.aggregation not in MAP_AGGREGATIONS:
+        raise NotAllowed(f"a map cannot show a {measure.aggregation.value}: its clusters could not combine it")
+    b = _Builder(report, dialect, params, columns_map)
+    y, x = _cell_key(b, lat, lon, size)
+    select = [f"avg({b.col(lat)}) AS yb_lat", f"avg({b.col(lon)}) AS yb_lon", "count(*) AS yb_n"]
+    if measure.field != "*":
+        col, agg = b.col(measure.field), measure.aggregation
+        if agg in (Aggregation.SUM, Aggregation.AVG):
+            select.append(f"sum({col}) AS yb_s")
+        if agg in (Aggregation.COUNT, Aggregation.AVG):
+            select.append(f"count({col}) AS yb_c")
+        if agg in (Aggregation.MIN, Aggregation.MAX):
+            select.append(f"{agg.value}({col}) AS yb_{agg.value}")
+    if report.map.label:
+        select.append(f"min({b.col(report.map.label)}) AS yb_label")
+    sql = [f"SELECT {', '.join(select)}", b.source(), _placed(b, report, filters),
+           f"GROUP BY {y}, {x}", dialect.limit(MAX_CELLS + 1)]
+    return Statement("\n".join(s for s in sql if s), b.binds)
+
+
 def default_view(
     report: Report,
     dialect: Dialect,
@@ -468,15 +657,22 @@ def default_view(
     """The aggregate of the report's ``view``: what the app sends before any user choice.
 
     As in the app: the first row group, split by the first column field unless the chart has one
-    dimension (a pie) or the field is already the row group, measured by the first measure.
+    dimension (a pie), the field is already the row group or the view has several measures, measured by its
+    measures, with its filters.
     """
     view = report.view
-    rows = [Group(f, default_grain(report, f, params)) for f in view.rows[:1]]
-    columns = [Group(f, default_grain(report, f, params)) for f in view.columns[:1]
-               if not view.chart.one_dimension and f not in view.rows[:1]]
-    m = view.measures[0]
-    return aggregate(report, dialect, params, rows=rows, columns=columns,
-                     measures=[Measure(m.field, m.aggregation)], columns_map=columns_map)
+    filters = [Filter(f.field, f.op, f.values) for f in view.filters]
+    measures = view_measures(report)
+    rows = [Group(f, default_grain(report, f, params, filters)) for f in view.rows[:1]]
+    columns = [Group(f, default_grain(report, f, params, filters)) for f in view.columns[:1]
+               if not view.chart.one_dimension and f not in view.rows[:1] and len(measures) == 1]
+    return aggregate(report, dialect, params, filters, rows=rows, columns=columns, measures=measures,
+                     columns_map=columns_map)
+
+
+def view_measures(report: Report) -> list[Measure]:
+    """The measures of ``report``'s view, each once, in order."""
+    return list(dict.fromkeys(Measure(m.field, m.aggregation) for m in report.view.measures))
 
 
 def _instant(value: Any, end: bool) -> datetime | None:
@@ -495,6 +691,13 @@ def timeframe(report: Report, name: str, params: Mapping[str, Any],
     narrowed by a ``between`` filter on the field when it is the field's only inclusion (several
     inclusions are alternatives, which can only widen the period).
     """
+    lo, hi = _ends(report, name, params, filters)
+    return (lo, hi) if lo is not None and hi is not None and lo <= hi else None
+
+
+def _ends(report: Report, name: str, params: Mapping[str, Any],
+          filters: Sequence[Filter]) -> tuple[datetime | None, datetime | None]:
+    """``timeframe``'s two ends, either one None when open."""
     ranges = [r for r in report.ranges if r.field == name] or [r for r in report.ranges if r.field is None]
     lo = hi = None
     if ranges:
@@ -504,7 +707,57 @@ def timeframe(report: Report, name: str, params: Mapping[str, Any],
         f_lo, f_hi = _instant(inclusions[0].values[0], False), _instant(inclusions[0].values[1], True)
         lo = max((x for x in (lo, f_lo) if x is not None), default=None)
         hi = min((x for x in (hi, f_hi) if x is not None), default=None)
-    return (lo, hi) if lo is not None and hi is not None and lo <= hi else None
+    return lo, hi
+
+
+def _naive(values: Any) -> pd.Series:
+    """Dates and timestamps, aware or not, as naive UTC."""
+    return pd.to_datetime(pd.Series(values), utc=True).dt.tz_localize(None)
+
+
+def _cut_by_data(spans: pd.DataFrame, grain: Grain) -> set[pd.Timestamp]:
+    """The first and the last period when the data covers less of it than of any other period.
+
+    ``spans``: ``extents``'s rows. The first period is cut when its first value comes later after its start than
+    in every other period (data from 14:00 on the first day, from 00:00 on the others); the last, when its last
+    value comes earlier before its end. Fewer than three periods: nothing to compare with, nothing cut.
+    """
+    spans = spans.dropna()
+    if len(spans) < 3:
+        return set()
+    starts = _naive(spans["yb_start"]).reset_index(drop=True)
+    lo, hi = _naive(spans["yb_lo"]).reset_index(drop=True), _naive(spans["yb_hi"]).reset_index(drop=True)
+    head, tail = lo - starts, starts + PERIODS[grain] - hi  # the room left before the first value, after the last
+    cut = set()
+    if head.iloc[0] > head.iloc[1:].max():
+        cut.add(starts.iloc[0])
+    if tail.iloc[-1] > tail.iloc[:-1].max():
+        cut.add(starts.iloc[-1])
+    return cut
+
+
+def complete_periods(values: pd.Series, report: Report, name: str, grain: Grain, params: Mapping[str, Any],
+                     filters: Sequence[Filter] = (), at: datetime | None = None,
+                     spans: pd.DataFrame | None = None) -> pd.Series:
+    """Which of ``values``, the starts of ``grain`` periods of date field ``name``, are whole in the result.
+
+    A period is partial when it starts before the ``timeframe`` or ends after it, or after ``at`` (default:
+    ``times.now()``): the first day of a month started at noon, today. With ``spans`` (``extents``'s result), the
+    data tells too, for a timeframe with an open end: see ``_cut_by_data``. An empty value is kept.
+    """
+    lo, hi = _ends(report, name, params, filters)
+    now = at or times.now()
+    if at is None and (day := times.frozen()):  # a set clock's day is whole: the data stops at its end
+        now = datetime(day.year, day.month, day.day) + timedelta(days=1)
+    last = now if hi is None else min(hi + timedelta(microseconds=1), now)  # the first instant not in the result
+    starts = _naive(values).set_axis(values.index)
+    ends = starts + PERIODS[grain]
+    whole = ends <= last
+    if lo is not None:
+        whole &= starts >= lo
+    if spans is not None:
+        whole &= ~starts.isin(_cut_by_data(spans, grain))
+    return whole | starts.isna()
 
 
 def default_grain(report: Report, name: str, params: Mapping[str, Any],

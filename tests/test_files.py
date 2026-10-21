@@ -121,3 +121,52 @@ def test_brackets_are_a_name_not_a_pattern(tmp_path):
     assert files.head(str(tmp_path / "*.log")) == ["one", "two"]   # a glob still matches
     with pytest.raises(FileNotFoundError):
         files.head(str(tmp_path / "*.csv"))
+
+
+def test_a_log_line_comes_back_whole_whatever_it_holds(tmp_path, con):
+    p = tmp_path / "yamlboard-dev.log"
+    lines = [r"FROM read_csv('x.log', delim = '\0', quote = '')", 'a "quote", a comma; a\ttab', "\\"]
+    p.write_text("\n".join(lines) + "\n")                       # the dev log holds its own SQL, '\0' included
+    assert [r[0] for r in con.sql(f"SELECT line FROM {files.reader(str(p), files.Format.LOG)}").fetchall()] == lines
+
+
+def test_multiline_keeps_each_trace_with_its_entry(tmp_path):
+    import duckdb
+
+    from yamlboard import files
+
+    a = tmp_path / "part-0001.log"
+    b = tmp_path / "part-0002.log"
+    a.write_text("orphan line\n"
+                 "2026-10-08 14:02:11.481 ERROR [exec-7] c.a.Orders - Payment failed\n"
+                 "java.lang.IllegalStateException: gateway timeout\n"
+                 "    at com.acme.Pay.call(Pay.java:118)\n")
+    b.write_text("    at com.acme.Orders.pay(Orders.java:64)\n"  # the trace goes on in the next part
+                 "2026-10-08 14:02:11.502 INFO  [exec-3] c.a.Orders - Order created\n")
+    fmt = files.LOG_FORMATS["logback"]
+    sql = files.log_sql(str(tmp_path / "part-*.log"), fmt.pattern, fmt.columns, multiline=True)
+    rows = duckdb.sql(sql).fetchall()
+    assert [r[1] for r in rows] == ["ERROR", "INFO"] and rows[0][2] == "exec-7"
+    assert rows[0][-1].splitlines() == ["java.lang.IllegalStateException: gateway timeout",
+                                        "    at com.acme.Pay.call(Pay.java:118)",
+                                        "    at com.acme.Orders.pay(Orders.java:64)"]
+    assert rows[1][-1] is None
+    single = duckdb.sql(files.log_sql(str(tmp_path / "part-*.log"), fmt.pattern, fmt.columns)).fetchall()
+    assert len(single) == 2 and len(single[0]) == len(rows[0]) - 1
+
+
+def test_multiline_refuses_a_group_named_trace():
+    import pytest
+
+    from yamlboard import files
+
+    with pytest.raises(ValueError, match="trace"):
+        files.log_sql("/x.log", r"^(?P<time>\S+) (?P<trace>.*)$", multiline=True)
+
+
+@pytest.mark.parametrize("multiline", [False, True])
+def test_a_percent_in_the_pattern_is_kept(tmp_path, con, multiline):
+    p = tmp_path / "disk.log"
+    p.write_text("95% /var full\n12% /home ok\n")
+    sql = files.log_sql(str(p), r"^(?P<pct>\d+%) (?P<msg>.*)$", multiline=multiline)
+    assert [r[0] for r in con.sql(sql).fetchall()] == ["95%", "12%"]

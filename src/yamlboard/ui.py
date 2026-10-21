@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import streamlit as st
 
-# st.logo's "large" is 2rem high, too small for an icon that is the brand: twice that, in the sidebar and in
+# st.logo's "large" is 2rem high, too small for an icon that is the brand: a third more, in the sidebar and in
 # the header (where it goes when the sidebar is collapsed).
 LOGO_CSS = """<style>
-[data-testid="stSidebarLogo"], [data-testid="stHeaderLogo"] { height: 4rem; max-width: 100%; }
+[data-testid="stSidebarLogo"], [data-testid="stHeaderLogo"] { height: 2.67rem; max-width: 100%; }
 </style>"""
 
 

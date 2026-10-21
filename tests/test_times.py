@@ -110,3 +110,28 @@ def test_period_bounds():
     assert times.period_bounds("last_year", True, at) == (date(2025, 3, 31), date(2026, 3, 31))
     assert "last_hour" not in times.DAY_PERIODS
     assert times.now().second == 0 and times.now().tzinfo is None
+
+
+def test_the_clock_set_to_a_day_ends_every_period_on_it(monkeypatch):
+    monkeypatch.setenv(times.TODAY_VAR, "2026-08-17")
+    assert times.frozen() == times.today() == date(2026, 8, 17)
+    assert times.now() == datetime(2026, 8, 17, 23, 59)                     # its last minute, the same all day
+    assert times.period_bounds("last_year", True) == (date(2025, 8, 17), date(2026, 8, 17))
+    assert times.period_bounds("last_day", False) == (datetime(2026, 8, 16, 23, 59), datetime(2026, 8, 17, 23, 59))
+    monkeypatch.setenv(times.TODAY_VAR, "")
+    assert times.frozen() is None and times.today() == datetime.now(timezone.utc).date()
+    monkeypatch.setenv(times.TODAY_VAR, "17/08/2026")
+    with pytest.raises(times.NotISO, match="YAMLBOARD_TODAY"):
+        times.today()
+
+
+@pytest.mark.parametrize("grain, first, expected", [
+    ("hour", datetime(2026, 3, 1, 22, 30), ["2026-03-01 22:00", "2026-03-01 23:00", "2026-03-02 00:00"]),
+    ("week", datetime(2026, 2, 25), ["2026-02-23 00:00", "2026-03-02 00:00"]),                        # Mondays
+    ("quarter", datetime(2025, 12, 31), ["2025-10-01 00:00", "2026-01-01 00:00"]),
+])
+def test_period_starts_are_those_date_trunc_gives(grain, first, expected):
+    starts = times.period_starts(first, datetime(2026, 3, 2, 0, 15), grain)
+    assert [f"{t:%Y-%m-%d %H:%M}" for t in starts] == expected
+    assert len(starts) == times.period_count(first, datetime(2026, 3, 2, 0, 15), grain)
+    assert times.period_starts(datetime(2026, 3, 2), datetime(2026, 3, 1), grain) == []

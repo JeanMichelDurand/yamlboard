@@ -8,14 +8,14 @@
       "cells": [
         {"view": "views/sales-view.json"},
         {"report": "sales", "title": "Orders by region", "width": 2,
-         "view": {"chart": "bar", "row": "region", "measure": "count"}}
+         "view": {"chart": "bar", "row": "region", "measures": ["count"]}}
       ]
     }
 
 The cells fill the grid row by row, ``width`` grid columns each (default 1). A cell's ``view`` is a saved view
 file (the board's :material/bookmark:), by its path from the dashboard's directory, or one report's part of
 such a file, written in the cell next to its ``report``; no view is the report's own. Only the chart is shown:
-the view's chart, grouping, measure, grains, colours, filters and period. The view is checked as an opened view
+the view's chart, grouping, measures, grains, colours, the chart's format, filters and period. The view is checked as an opened view
 is (``settings.restore``): what a report no longer allows is skipped, and said so on the cell.
 
 Dashboard files live in the reports directory's ``dashboards/`` (and its sub-directories); the board can also
@@ -32,7 +32,7 @@ from typing import Any
 
 from yamlboard import charts, settings, times
 from yamlboard import query as q
-from yamlboard.schema import ChartType, Grain, Report
+from yamlboard.schema import ChartFormat, ChartType, Grain, Report
 
 VERSION = 1
 MAX_COLUMNS = 6
@@ -196,12 +196,18 @@ class Plan:
     kind: ChartType
     row: str | None
     column: str | None
-    measure: q.Measure
+    measures: list[q.Measure]
     grains: dict[str, Grain | None]
     colors: dict[str, dict[str, str]]
     keys: dict[str, Any]  # the session-state keys of the view, to open it on the Reports page
     skipped: list[str]
     period: str = ""  # the first range's period, as a caption says it
+    fmt: ChartFormat = field(default_factory=ChartFormat)
+
+    @property
+    def shown(self) -> list[q.Measure]:
+        """The chart's measures: a pie shows the first."""
+        return self.measures[:1] if self.kind.one_dimension else self.measures
 
     def groups(self) -> tuple[list[q.Group], list[q.Group]]:
         rows = [q.Group(self.row, self.grains.get(self.row))] if self.row else []
@@ -244,15 +250,16 @@ def plan(cell: Cell, report: Report) -> Plan:
 
     kind = setting("chart", view.chart)
     row = setting("row", view.rows[0] if view.rows else None)
-    column = None if kind.one_dimension else setting("col", view.columns[0] if view.columns else None)
+    offered = settings.measures(report)
+    measures = [offered[a] for a in setting("measures", settings.default_measures(report))]
+    column = None if kind.one_dimension or len(measures) > 1 else setting("col", view.columns[0] if view.columns else None)
     if column == row:
         column = None
-    measures = settings.measures(report)
-    default_m = q.Measure(view.measures[0].field, view.measures[0].aggregation).alias
-    measure = measures[setting("measure", default_m if default_m in measures else next(iter(measures)))]
-    filters = setting("filters", [])
+    filters = setting("filters", settings.view_filters(report))
     grains = {f: setting(f"grain:{f}", None) for f in (row, column) if f and report.field_map[f].grains}
-    return Plan(raw, filters, kind, row, column, measure, grains, setting("colors", {}), keys, skipped, period)
+    fmt, problems = settings.format_of(keys, report)
+    return Plan(raw, filters, kind, row, column, measures, grains, setting("colors", {}), keys,
+                skipped + [f"{rid}: {p}" for p in problems], period, fmt)
 
 
 def with_grains(p: Plan, report: Report, params: Mapping[str, Any]) -> Plan:
@@ -262,7 +269,7 @@ def with_grains(p: Plan, report: Report, params: Mapping[str, Any]) -> Plan:
 
 
 def chart_title(p: Plan, report: Report) -> str:
-    return charts.title(report, p.measure, p.row, p.grains.get(p.row), p.column, p.grains.get(p.column))
+    return charts.title(report, p.shown, p.row, p.grains.get(p.row), p.column, p.grains.get(p.column))
 
 
 def skeleton(name: str, views: Sequence[tuple[str, bytes]], columns: int = DEFAULT_COLUMNS,

@@ -6,7 +6,7 @@ import pytest
 from tests.conftest import EXAMPLES
 from yamlboard import query as q
 from yamlboard import times
-from yamlboard.schema import ChartType, Grain
+from yamlboard.schema import AxisSide, ChartType, Empty, Grain, Units
 
 APP = Path(__file__).parents[1] / "src" / "yamlboard" / "app.py"
 
@@ -33,12 +33,23 @@ def charts_of(app):
     return app.get("arrow_vega_lite_chart") or app.get("vega_lite_chart")
 
 
+def detail_of(app):
+    """The rows of the detail's table (a custom component, see sort_table), as text, None if it is not shown."""
+    import pandas as pd
+
+    tables = [e for e in app.get("bidi_component") if e.proto.component_name == "yamlboard_sort_table"]
+    if not tables:
+        return None
+    data = json.loads(tables[0].proto.json)
+    return pd.DataFrame(data["rows"], columns=[c["name"] for c in data["columns"]])
+
+
 @pytest.mark.parametrize("mode", ["Pivot", "Detail"])
 def test_modes(app, mode):
     app.run()
     app.segmented_control(key="sales:mode:advanced").set_value([mode]).run()
     assert not app.exception and not app.error
-    assert app.dataframe and not charts_of(app)
+    assert (app.dataframe if mode == "Pivot" else detail_of(app) is not None) and not charts_of(app)
 
 
 def test_views_stack_in_a_fixed_order(app):
@@ -47,7 +58,7 @@ def test_views_stack_in_a_fixed_order(app):
     assert not app.exception and not app.error
     cards = [m.value for m in app.main.markdown if m.value.startswith("**")]
     assert cards == ["**Sum of Amount by Order date (week), split by Region**", "**Detail**"]  # 1 year: weeks
-    assert charts_of(app) and app.dataframe        # the chart, then the rows under it
+    assert charts_of(app) and detail_of(app) is not None  # the chart, then the rows under it
     app.segmented_control(key="sales:mode:advanced").set_value([]).run()
     assert app.info[0].value.startswith("Pick a view")
 
@@ -80,7 +91,7 @@ def test_detail_pages(app):
     app.selectbox(key="sales:page_size").set_value(5).run()
     found = next(c.value for c in app.caption if c.value.endswith("rows found"))
     total = int(found.split()[0].replace(",", ""))
-    assert len(app.dataframe[0].value) == 5
+    assert len(detail_of(app)) == 5
     assert app.button(key="sales:prev").disabled and not app.button(key="sales:next").disabled
     app.button(key="sales:next").click().run()
     assert not app.exception and not app.error
@@ -90,19 +101,35 @@ def test_detail_pages(app):
     assert any(f"Page **1** of {-(-total // 200)}" in m.value for m in app.markdown)
 
 
+def test_full_screen_shows_one_view_and_keeps_the_filters(app):
+    app.run()
+    app.segmented_control(key="sales:mode:advanced").set_value(["Chart", "Detail"]).run()
+    app.button(key="sales:focus:detail").click().run()
+    assert not app.exception and not app.error
+    assert app.session_state["sales:focus"] == "Detail"
+    assert detail_of(app) is not None and not charts_of(app)   # the chart is left out
+    assert any("stSidebar" in h.proto.body for h in app.get("html"))              # the sidebar is hidden
+    assert app.selectbox(key="sales:new_field") is not None                        # the filters are at hand
+    app.button(key="sales:focus:detail").click().run()                            # and back
+    assert app.session_state["sales:focus"] is None and charts_of(app)
+    app.segmented_control(key="sales:mode:advanced").set_value(["Chart"]).run()
+    app.button(key="sales:focus:aggregate").click().run()
+    assert app.session_state["sales:focus"] == "Chart" and detail_of(app) is None
+
+
 def test_detail_columns_can_be_picked(app):
     app.run()
     app.segmented_control(key="sales:mode:advanced").set_value(["Detail"]).run()
     picker = app.multiselect(key="sales:detail_cols")
-    assert list(app.dataframe[0].value.columns) == picker.value
+    assert list(detail_of(app).columns) == picker.value
     picker.set_value(["amount", "region"]).run()      # shown in the order picked
     assert not app.exception and not app.error
-    assert list(app.dataframe[0].value.columns) == ["amount", "region"]
+    assert list(detail_of(app).columns) == ["amount", "region"]
     app.button(key="sales:col_down:amount").click().run()  # the arrows move a column
-    assert list(app.dataframe[0].value.columns) == ["region", "amount"]
+    assert list(detail_of(app).columns) == ["region", "amount"]
     assert app.button(key="sales:col_up:region").disabled
     picker.set_value([]).run()                        # none: the default columns, not an empty table
-    assert len(app.dataframe[0].value.columns) > 2
+    assert len(detail_of(app).columns) > 2
 
 
 def test_chart_names_are_plain_text(app):
@@ -174,9 +201,10 @@ def test_basic_mode_hides_the_pivot_and_the_sql_not_the_sort(app):
     assert not app.code                                # no SQL expander
     app.segmented_control(key="sales:mode:basic").set_value(["Detail"]).run()
     assert not app.code
-    app.selectbox(key="sales:sort").set_value("amount").run()
-    app.toggle(key="sales:desc").set_value(True).run()
-    amounts = list(app.dataframe[0].value["amount"])
+    app.selectbox(key="sales:sort_add").set_value("amount").run()
+    app.button(key="sales:sort_dir:amount").click().run()
+    assert app.session_state["sales:order"] == [("amount", True)]
+    amounts = detail_of(app)["amount"].str.replace("\u202f", "").astype(float).tolist()
     assert amounts == sorted(amounts, reverse=True) and len(amounts) > 1
     app.toggle(key="advanced").set_value(True).run()
     assert "Pivot" in app.segmented_control(key="sales:mode:advanced").options and app.code
@@ -238,6 +266,20 @@ def test_grain_follows_the_period(app):
     assert not app.exception and grain() == "day"                  # a new period: its default
 
 
+def test_hide_partial_periods(app):
+    app.run()
+    groups = lambda: next(c.value for c in app.main.caption if " groups" in c.value)
+    box = app.checkbox(key="sales:hide_partial")
+    assert box.value is False and "partial" not in groups()        # off by default
+    before = int(groups().split()[0].replace(",", ""))
+    box.check().run()
+    assert not app.exception and not app.error
+    hidden = int(groups().split(" · ")[-1].split()[0])             # this week is not over: at least one
+    assert hidden >= 1 and int(groups().split()[0].replace(",", "")) == before - hidden
+    app.selectbox(key="sales:row").set_value("region").run()
+    assert not app.exception and not [c for c in app.checkbox if c.key == "sales:hide_partial"]  # no date grain: no box
+
+
 def test_periods_end_now(app):
     app.run()
     period = app.selectbox(key="sales:period:start")
@@ -293,3 +335,126 @@ def test_a_quick_colour_applies_in_one_click(app):
     assert not app.exception and not app.error
     scale = json.loads(charts_of(app)[0].proto.spec)["encoding"]["color"]["scale"]
     assert scale["range"][scale["domain"].index("South")] == "#d00000"
+
+
+def test_a_filter_added_from_the_chart_is_flagged_once(app):
+    # What pick() leaves when a mark or a legend entry is clicked (AppTest cannot click a Vega chart).
+    app.session_state["sales:filters_added"] = [q.Filter("region", "in", ("North",))]
+    app.run()
+    assert not app.exception and not app.error
+    assert "Region is any of North" in app.toast[0].value
+    css = [h.proto.body for h in app.get("html") if "NEW" in h.proto.body]
+    assert css and ".st-key-sales-filters_open button" in css[0]
+    app.run()  # the next run: no toast, no badge
+    assert not app.toast and not [h for h in app.get("html") if "NEW" in h.proto.body]
+
+
+def test_key_class_follows_the_frontend():
+    from yamlboard.report_view import key_class
+
+    assert key_class(" sales:filters_open ") == "st-key-sales-filters_open"
+    assert key_class("a b/é_1-2") == "st-key-a-b--_1-2"
+
+
+def test_refresh_runs_the_queries_again(app, monkeypatch):
+    from yamlboard import engine
+
+    calls = []
+    real = engine.run
+    monkeypatch.setattr("yamlboard.board.run", lambda *a: calls.append(1) or real(*a))
+    app.run()
+    before = len(calls)
+    app.run()
+    assert len(calls) == before  # from the cache
+    app.button(key="sales:refresh").click().run()
+    assert len(calls) > before and app.session_state["yb:refresh"] == 1
+    assert app.selectbox(key="sales:refresh_every").options == ["Off", "30 s", "1 min", "5 min", "15 min"]
+
+
+def test_auto_refresh_draws_its_timer_only_when_on(app):
+    app.run()
+    assert "sales:page_run" not in app.session_state
+    app.selectbox(key="sales:refresh_every").set_value(60).run()
+    # The page run marked itself and the timer's fragment read the mark: no refresh counted for it.
+    assert not app.exception and "sales:page_run" not in app.session_state
+    assert app.session_state["yb:refresh"] == 0 if "yb:refresh" in app.session_state else True
+
+
+def test_several_measures_are_drawn_unsplit(app):
+    app.run()
+    app.multiselect(key="sales:measures").set_value(["sum_amount", "count"]).run()
+    assert not app.exception and not app.error
+    sql = app.code[0].value
+    assert 'AS "sum_amount"' in sql and 'AS "count"' in sql and '"region"' not in sql.split("GROUP BY")[1]
+    assert "Several measures: not split by Region." in [c.value for c in app.caption]
+    assert charts_of(app)
+    cards = [m.value for m in app.main.markdown if m.value.startswith("**")]
+    assert cards[0] == "**Sum of Amount and Row count by Order date (week)**"
+    app.multiselect(key="sales:measures").set_value([]).run()
+    assert app.info[0].value == "Pick a measure."
+
+
+def test_the_chart_format_puts_a_measure_on_the_secondary_axis(app):
+    app.run()
+    app.multiselect(key="sales:measures").set_value(["sum_amount", "count"]).run()
+    app.selectbox(key="sales:series_chart:count").set_value(ChartType.LINE).run()
+    app.segmented_control(key="sales:series_axis:count").set_value(AxisSide.SECONDARY).run()
+    app.selectbox(key="sales:axis:secondary:units").set_value(Units.THOUSANDS).run()
+    app.segmented_control(key="sales:empty").set_value(Empty.ZERO).run()
+    assert not app.exception and not app.error
+    spec = json.loads(charts_of(app)[0].proto.spec)
+    assert spec["resolve"] == {"scale": {"y": "independent"}}
+    assert [layer["mark"]["type"] for layer in spec["layer"]] == ["line", "line"]   # the chart is a line too
+
+
+
+def test_trim_empty_periods_is_a_chart_format_option(app):
+    app.run()
+    app.checkbox(key="sales:trim_empty").check().run()   # what it trims: test_charts' fill tests
+    assert not app.exception and not app.error and charts_of(app)
+    assert app.session_state["sales:trim_empty"] is True
+
+
+def test_an_axis_the_board_cannot_take_says_so(app):
+    app.run()
+    app.number_input(key="sales:axis:primary:min").set_value(10).run()
+    app.number_input(key="sales:axis:primary:max").set_value(5).run()
+    assert not app.exception
+    assert any("Primary axis: the axis's min (10) is not below its max (5): not applied." in c.value
+               for c in app.caption)
+
+
+def test_the_clock_set_to_a_day_ends_the_period_and_says_so(app, monkeypatch):
+    from yamlboard import times
+
+    monkeypatch.setenv(times.TODAY_VAR, "2026-08-17")
+    app.run()
+    assert not app.exception
+    assert "2025-08-17 to 2026-08-17, UTC: the board's clock is set to 2026-08-17" in [c.value for c in app.sidebar.caption]
+    binds = next(c.value for c in app.caption if c.value.startswith("Binds:"))
+    assert "'start': datetime.date(2025, 8, 17), 'end': datetime.date(2026, 8, 17)" in binds
+
+
+def map_of(app):
+    """The map component's data, None if it is not shown."""
+    found = [e for e in app.get("bidi_component") if e.proto.component_name == "yamlboard_map"]
+    return json.loads(found[0].proto.json) if found else None
+
+
+def test_a_report_with_a_map_opens_on_it(app):
+    app.session_state["report"] = "places"
+    app.session_state["advanced"] = False
+    app.run()
+    assert not app.exception and not app.error
+    assert app.segmented_control(key="places:mode:basic").options == ["Chart", "Map", "Detail"]
+    data = map_of(app)
+    assert data and data["kind"] == "sum" and sum(data["cells"]["n"]) == 20_000
+    assert "**Sum of Power (kW) by place**" in [m.value for m in app.main.markdown]
+
+
+def test_a_median_is_not_mapped(app):
+    app.session_state["report"] = "places"
+    app.run()
+    app.multiselect(key="places:measures").set_value(["median_power_kw"]).run()
+    assert not app.exception and map_of(app) is None
+    assert any("cannot show the median" in i.value for i in app.info)
