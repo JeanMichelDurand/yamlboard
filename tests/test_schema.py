@@ -1,15 +1,21 @@
 import pytest
+from pydantic import ValidationError
 
 from tests.conftest import EXAMPLES, FIXTURES
 from yamlboard import query as q
 from yamlboard.schema import (
     Aggregation,
+    AxisDef,
+    AxisSide,
     ChartType,
+    Empty,
     FieldType,
     Grain,
     Report,
     ReportError,
     Rule,
+    Series,
+    Units,
     load_report,
     load_reports,
     sql_binds,
@@ -33,7 +39,7 @@ def test_legacy_keys_load_unchanged():
 
 
 def test_examples_load(ws):
-    assert set(ws.reports) == {"ash-activity", "sales", "pg-activity", "app-log", "duckdb-catalog"} and not ws.errors
+    assert set(ws.reports) == {"ash-activity", "sales", "pg-activity", "app-log", "duckdb-catalog", "places"} and not ws.errors
 
 
 def test_groupable_shortcut_and_measures():
@@ -62,6 +68,8 @@ def _report(**over):
         ({"view": {"rows": ["n"]}}, "'n' is not a field with groupable_rows"),
         ({"view": {"measures": [{"field": "n", "aggregation": "avg"}]}}, "avg of 'n' is not allowed"),
         ({"view": {"measures": [{"field": "*", "aggregation": "sum"}]}}, "'*' only supports count"),
+        ({"view": {"filters": [{"field": "a", "values": ["x"]}]}}, "view.filters: 'a' is not filterable"),
+        ({"view": {"filters": [{"field": "nope"}]}}, "view.filters: 'nope' is not a field"),
         ({"fields": [{"name": "a", "grains": ["day"]}]}, "grains need a date or timestamp"),
         ({"fields": [{"name": "a", "measures": ["sum"]}]}, "sum need a numeric field"),
         ({"rules": [{"param": "x", "rule": "max", "value": 1}]}, "unknown parameter 'x'"),
@@ -178,3 +186,40 @@ def test_colours_are_checked_and_keyed_by_the_value_as_text():
     assert r.view.color == "#174d98"
     with pytest.raises(ValueError, match="not a #rrggbb colour"):
         _report(view={"color": "red"})
+
+
+def test_view_filters_and_partial_periods_load_and_are_checked():
+    fields = [{"name": "a", "filterable": True}, {"name": "n", "type": "integer", "filterable": True}]
+    r = _report(fields=fields, view={"filters": [{"field": "a", "values": "x"}, {"field": "n", "op": "between",
+                                                                                  "values": [1, None]}],
+                                     "hide_partial": True})
+    assert [(f.field, f.op, f.values) for f in r.view.filters] == [("a", "in", ("x",)), ("n", "between", (1, None))]
+    assert r.view.hide_partial and not _report().view.hide_partial and _report().view.filters == ()
+    for bad, message in (({"field": "n", "op": "between", "values": [1]}, "takes 2 values"),
+                         ({"field": "a", "op": "like", "values": ["x"]}, "unknown filter operator"),
+                         ({"field": "a", "op": "is_null", "values": ["x"]}, "takes no value")):
+        with pytest.raises(ValueError, match=message):
+            _report(fields=fields, view={"filters": [bad]})
+
+
+def test_a_view_of_several_measures_with_its_chart_format():
+    view = {"rows": ["a"], "chart": "column",
+            "measures": [{"field": "n", "aggregation": "sum"}, {"field": "*", "chart": "Line", "axis": "secondary"}],
+            "empty": "zero", "trim_empty": True, "axes": {"secondary": {"min": 0, "units": "thousands", "prefix": "$"}}}
+    fmt = _report(view=view).view.chart_format()
+    assert fmt.trim_empty and not _report(view={"rows": ["a"]}).view.chart_format().trim_empty
+    assert fmt.empty is Empty.ZERO and fmt.series["count"] == Series(ChartType.LINE, AxisSide.SECONDARY)
+    assert fmt.axes == {AxisSide.SECONDARY: AxisDef(min=0, units=Units.THOUSANDS, prefix="$")}
+    assert fmt.axis(AxisSide.PRIMARY) == AxisDef()
+
+
+@pytest.mark.parametrize("view, message", [
+    ({"measures": [{"field": "*", "chart": "pie"}]}, "a measure's own chart is one of column, line, area"),
+    ({"axes": {"primary": {"min": 3, "max": 3}}}, "is not below its max"),
+    ({"axes": {"primary": {"log": True, "min": -1}}}, "a log scale's bounds are above zero"),
+    ({"axes": {"primary": {"decimals": 7}}}, "less than or equal to 6"),
+    ({"empty": "blank"}, "'gaps', 'zero' or 'connect'"),
+])
+def test_a_bad_chart_format_is_refused(view, message):
+    with pytest.raises(ValidationError, match=message):
+        _report(view=view)

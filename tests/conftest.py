@@ -42,6 +42,16 @@ def log_dir(tmp_path_factory):
     mp.undo()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def cases_root(tmp_path_factory):
+    """fetch's cases, and every command's purge of the expired ones, out of the home directory."""
+    mp = pytest.MonkeyPatch()
+    d = tmp_path_factory.mktemp("cases")
+    mp.setenv("YAMLBOARD_CASES", str(d))
+    yield d
+    mp.undo()
+
+
 @pytest.fixture(scope="session")
 def ws() -> Workspace:
     return Workspace.open(EXAMPLES)

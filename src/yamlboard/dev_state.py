@@ -18,11 +18,11 @@ from yamlboard.engine import engine_for, error_text, sql_text
 from yamlboard.schema import FieldType
 
 
-def init(conn: str, yaml_text: str = "") -> None:
+def init(conn: str, yaml_text: str = "", yaml_path: str = "") -> None:
     defaults = {
         "conn": conn, "url": None, "conn_error": None, "file": None, "file_path": "", "file_format": "auto",
         "dev_sql": "", "sql_version": 0, "bind_types": {}, "tested_params": {}, "preview": None,
-        "yaml_text": yaml_text, "yaml_version": 0,
+        "yaml_text": yaml_text, "yaml_version": 0, "yaml_path": yaml_path,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)

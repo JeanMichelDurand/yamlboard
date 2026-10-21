@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from yamlboard import cases
 from yamlboard.schema import FieldType
 
 MEMORY_URL = "duckdb:///:memory:"
@@ -54,6 +55,7 @@ def resolve(path: str) -> str:
     if not path:
         raise ValueError("no file given")
     full = str(Path(path).expanduser().absolute())
+    cases.check_readable(full)  # an expired case of production logs is not read, even before it is deleted
     if not _matches(full):
         raise FileNotFoundError(f"no file matches {full}")
     if Path(full).is_dir():
@@ -100,8 +102,9 @@ def reader(path: str, fmt: Format) -> str:
         return f"read_json_auto({p})"
     if fmt is Format.PARQUET:
         return f"read_parquet({p})"
-    # One VARCHAR column: no delimiter (NUL), no quote, no escape, so every line comes back whole.
-    return (f"read_csv({p}, columns = {{'line': 'VARCHAR'}}, header = false, delim = '\\0', quote = '', "
+    # One VARCHAR column: no delimiter (a NUL byte), no quote, no escape, so every line comes back whole. Not
+    # '\\0': DuckDB reads it as two characters, a backslash and a zero, and splits the lines that hold them.
+    return (f"read_csv({p}, columns = {{'line': 'VARCHAR'}}, header = false, delim = chr(0), quote = '', "
             "escape = '', auto_detect = false)")
 
 
@@ -177,6 +180,13 @@ LOG_FORMATS: dict[str, LogFormat] = {
         _cols(Column("time", FieldType.TIMESTAMP)),
         "yamlboard's own log has this format.",
     ),
+    "logback": LogFormat(
+        "Java Logback / Log4j (time level [thread] logger - message)",
+        r"^(?P<time>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+(?P<level>[A-Z]+)\s+"
+        r"\[(?P<thread>[^\]]*)\]\s+(?P<logger>\S+)\s+-\s+(?P<message>.*)$",
+        _cols(Column("time", FieldType.TIMESTAMP)),
+        "Their stack traces follow the entry on lines of their own: keep them with \"Stack traces\".",
+    ),
     "iso": LogFormat(
         "ISO time, level, message",
         r"^(?P<time>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+\[?"
@@ -218,20 +228,52 @@ def _cast(c: Column) -> str:
     return value
 
 
-def log_sql(path: str, pattern: str, columns: dict[str, Column] | None = None) -> str:
+TRACE = "trace"
+
+
+def log_sql(path: str, pattern: str, columns: dict[str, Column] | None = None, multiline: bool = False) -> str:
     """One row per matching line of ``path``, one column per named group of ``pattern``.
 
     ``columns`` types the groups; a group it does not name is text. A value that does not convert
     (a ``-`` for a size, a malformed date) is NULL, not an error.
+
+    ``multiline``: a line the pattern does not match continues the entry above it (a stack trace) and goes in a
+    ``trace`` column, its lines joined by newlines, instead of being left out. Lines before the first match are.
     """
     names = groups(pattern)
+    if multiline and TRACE in names:
+        raise ValueError(f"group name {TRACE!r} is the stack trace's column: rename the group")
     columns = columns or {}
     slots = [n or f"_g{i}" for i, n in enumerate(names, 1)]  # regexp_extract maps names to groups by position
     select = ",\n       ".join(f'{_cast(columns.get(n, Column(n)))} AS "{n}"' for n in names if n)
     rx = literal(pattern)
-    return (f"SELECT {select}\n"
-            f"FROM (\n    SELECT regexp_extract(line, {rx}, [{', '.join(literal(s) for s in slots)}]) AS m\n"
-            f"    FROM {reader(path, Format.LOG)}\n    WHERE regexp_matches(line, {rx})\n) AS parsed")
+    keys = ", ".join(literal(s) for s in slots)
+
+    def extract(arg: str) -> str:  # not %-formatting: the pattern may hold a %
+        return f"regexp_extract({arg}, {rx}, [{keys}])"
+
+    if not multiline:
+        return (f"SELECT {select}\n"
+                f"FROM (\n    SELECT {extract('line')} AS m\n"
+                f"    FROM {reader(path, Format.LOG)}\n    WHERE regexp_matches(line, {rx})\n) AS parsed")
+    # Lines are numbered right on the read, by an OVER () with nothing to reorder them: the files in name order, each
+    # line in its file's order (measured on DuckDB 1.5.6, 8 threads: 9 million lines of plain and .gz files, none out
+    # of order; a PARTITION BY there does reorder them). An entry is a matching line and the lines after it.
+    return (f'SELECT {select},\n       {TRACE}\n'
+            f"FROM (\n"
+            f"    SELECT entry, {extract('arg_min(line, n)')} AS m,\n"
+            f"           string_agg(line, chr(10) ORDER BY n) FILTER (WHERE NOT head) AS {TRACE}\n"
+            f"    FROM (\n"
+            f"        SELECT line, n, head, sum(CAST(head AS INTEGER)) OVER (ORDER BY n ROWS UNBOUNDED PRECEDING) AS entry\n"
+            f"        FROM (\n"
+            f"            SELECT line, n, regexp_matches(line, {rx}) AS head\n"
+            f"            FROM (SELECT line, row_number() OVER () AS n FROM {reader(path, Format.LOG)}) AS numbered\n"
+            f"        ) AS marked\n"
+            f"    ) AS grouped\n"
+            f"    WHERE entry > 0\n"
+            f"    GROUP BY entry\n"
+            f") AS parsed\n"
+            f"ORDER BY entry")  # a GROUP BY keeps no order: the entries in the files' order
 
 
 def match_sql(path: str, pattern: str) -> str:

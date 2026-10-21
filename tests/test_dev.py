@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import EXAMPLES
+from yamlboard import query as q
+from yamlboard.schema import ChartType, parse_report
 
 DEV = Path(__file__).parents[1] / "src" / "yamlboard" / "dev.py"
 
@@ -177,3 +179,71 @@ def test_a_tested_value_of_another_type_is_not_the_default(dev, monkeypatch):
     dev.run()
     dev.switch_page("dev_pages/report.py").run()
     assert not dev.exception and not dev.error
+
+
+def test_the_view_and_the_yaml_follow_each_other(dev, monkeypatch, tmp_path):
+    monkeypatch.setenv("YAMLBOARD_DEV_YAML", str(EXAMPLES / "sales.yml"))
+    dev.run()
+    dev.switch_page("dev_pages/report.py").run()
+    original = dev.session_state["yaml_text"]
+    assert dev.text_input(key="yaml_path").value == str(EXAMPLES / "sales.yml")
+
+    dev.selectbox(key="sales:chart").set_value(ChartType.BAR).run()           # the controls into the YAML
+    dev.selectbox(key="sales:col").set_value("product").run()
+    dev.session_state["sales:filters"] = [q.Filter("region", "in", ("North",))]
+    button(dev, "Update the YAML").click().run()
+    assert not dev.exception and not dev.error
+    text = dev.session_state["yaml_text"]
+    assert dev.text_area[0].value == text
+    view = parse_report(text).view
+    assert (view.chart.value, view.rows, view.columns) == ("bar", ("order_date",), ("product",))
+    assert [(f.field, f.op, f.values) for f in view.filters] == [("region", "in", ("North",))]
+    assert text.split("view:")[0] == original.split("view:")[0]          # the rest as written, comments too
+    assert text.split("\nreadme:")[1] == original.split("\nreadme:")[1]
+    assert dev.selectbox(key="sales:chart").value.value == "bar"        # the controls stay
+
+    dev.text_area[0].set_value(text.replace("chart: bar", "chart: area").replace("North", "South")).run()
+    assert not dev.exception and not dev.error                           # a YAML edit into the controls
+    assert dev.selectbox(key="sales:chart").value.value == "area"
+    assert dev.session_state["sales:filters"] == [q.Filter("region", "in", ("South",))]
+
+    target = tmp_path / "out" / "sales.yml"
+    target.parent.mkdir()
+    dev.text_input(key="yaml_path").set_value(str(target)).run()
+    button(dev, "Save").click().run()
+    assert not dev.exception and f"Saved to `{target}`" in dev.success[-1].value
+    assert target.read_text(encoding="utf-8") == dev.session_state["yaml_text"]
+    dev.text_input(key="yaml_path").set_value(str(tmp_path / "missing" / "x.yml")).run()
+    button(dev, "Save").click().run()
+    assert "Not saved" in dev.error[0].value
+
+
+def test_the_map_fields_apply_at_once_then_go_into_the_yaml(dev, monkeypatch):
+    monkeypatch.setenv("YAMLBOARD_DEV_YAML", str(EXAMPLES / "places.yml"))
+    dev.run()
+    dev.switch_page("dev_pages/report.py").run()
+    lat = next(s for s in dev.selectbox if s.key.startswith("map:places:lat:"))
+    assert lat.value == "lat"
+    lat.select_index(0).run()                                            # None: no map, the view goes at once
+    assert not dev.exception and not dev.error
+    assert "Map" not in dev.segmented_control(key="places:mode:basic").options
+    button(dev, "Update the YAML").click().run()
+    assert parse_report(dev.session_state["yaml_text"]).map is None
+    assert "\nmap:" not in dev.session_state["yaml_text"]
+    for role, name in (("lat", "lat"), ("lon", "lon")):                  # picked again, before any update
+        next(s for s in dev.selectbox if s.key.startswith(f"map:places:{role}:")).set_value(name).run()
+    assert "Map" in dev.segmented_control(key="places:mode:basic").options
+    button(dev, "Update the YAML").click().run()
+    assert parse_report(dev.session_state["yaml_text"]).map.lon == "lon"
+
+
+def test_full_screen_leaves_the_editor_out(dev, monkeypatch):
+    monkeypatch.setenv("YAMLBOARD_DEV_YAML", str(EXAMPLES / "sales.yml"))
+    dev.run()
+    dev.switch_page("dev_pages/report.py").run()
+    dev.segmented_control(key="sales:mode:basic").set_value(["Chart", "Detail"]).run()
+    dev.button(key="sales:focus:detail").click().run()
+    assert not dev.exception and not dev.error
+    assert not dev.text_area and not [b for b in dev.button if b.label == "Update the YAML"]
+    dev.button(key="sales:focus:detail").click().run()
+    assert dev.text_area and dev.text_area[0].value == dev.session_state["yaml_text"]

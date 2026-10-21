@@ -27,7 +27,7 @@ except logs.LogDirError as e:  # logging is compulsory: no log, no app
 PAGES = Path(__file__).with_name("dev_pages")
 _yaml_file = os.environ.get("YAMLBOARD_DEV_YAML")
 dev_state.init(os.environ.get("YAMLBOARD_DEV_URL", "duckdb:///:memory:"),
-               Path(_yaml_file).read_text(encoding="utf-8") if _yaml_file else "")
+               Path(_yaml_file).read_text(encoding="utf-8") if _yaml_file else "", _yaml_file or "")
 if st.session_state.url is None and st.session_state.conn_error is None:  # the source on the command line
     if _file := os.environ.get("YAMLBOARD_DEV_FILE"):
         st.session_state.file_path = _file
@@ -124,7 +124,8 @@ with st.sidebar:
         st.caption(f"Connected to `{dev_state.masked(st.session_state.url)}`")
 
     uploaded = st.file_uploader("Report YAML", type=["yml", "yaml"], key="upload",
-                                help="Opens the file on the Report page; nothing is written back to it.")
+                                help="Opens the file on the Report page. A browser sends a copy, not its path: *Save* "
+                                     "there writes to the path it shows.")
     if uploaded is not None and st.session_state.get("uploaded_id") != uploaded.file_id:
         st.session_state.uploaded_id = uploaded.file_id
         dev_state.set_yaml(uploaded.getvalue().decode("utf-8"))

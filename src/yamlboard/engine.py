@@ -5,8 +5,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 import uuid
+import weakref
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -28,6 +32,28 @@ DB_ERRORS = (SQLAlchemyError, pd.errors.DatabaseError)
 _ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # What SQLAlchemy's text() reads as a bind (``TextClause._bind_params_regex``), and its escape ``\:name``.
 _TEXT_BIND = re.compile(r"(?<![:\w\\]):(\w+)(?!:)")
+# A DuckDB file's statements, one at a time: the connections one process opens to a file share one database,
+# so one memory_limit, and four heavy statements at once ran it out of memory where each alone spills to disk.
+# Keyed by the file, not the URL: two spellings of one file (relative, absolute) share its lock.
+_ONE_AT_A_TIME: weakref.WeakKeyDictionary[Engine, threading.Lock] = weakref.WeakKeyDictionary()
+_FILE_LOCKS: dict[str, threading.Lock] = {}
+_WANTED = threading.local()
+
+
+class Abandoned(Exception):
+    """The page that asked for a statement is gone (a rerun): it is dropped before it starts."""
+
+
+@contextmanager
+def abandoned_when(gone: threading.Event) -> Iterator[None]:
+    """The statements this thread runs in the block are dropped, before they start, once ``gone`` is set: a
+    dashboard's cells queued behind a DuckDB file's lock do not run for a page that was rerun."""
+    previous = getattr(_WANTED, "gone", None)
+    _WANTED.gone = gone
+    try:
+        yield
+    finally:
+        _WANTED.gone = previous
 
 
 def sql_text(sql: str) -> TextClause:
@@ -80,12 +106,16 @@ def engine_for(url: str) -> Engine:
     """An engine whose every connection runs in UTC.
 
     A DuckDB file is opened per statement and closed after it (no pool): an open connection locks the file
-    against every other process, so a pooled one would block a writer for as long as the app runs.
+    against every other process, so a pooled one would block a writer for as long as the app runs. Its
+    statements run one at a time (``_ONE_AT_A_TIME``).
     """
     full = expand_env(url)
     parsed = make_url(full)
     on_file = parsed.get_backend_name() == "duckdb" and parsed.database not in (None, "", ":memory:")
     engine = create_engine(full, **({"poolclass": NullPool} if on_file else {}))
+    if on_file:
+        _ONE_AT_A_TIME[engine] = _FILE_LOCKS.setdefault(str(Path(parsed.database).expanduser().resolve()),
+                                                        threading.Lock())
     utc = for_name(engine.dialect.name).utc_session()
 
     @event.listens_for(engine, "connect")
@@ -121,17 +151,21 @@ def run(engine: Engine, statement: Statement) -> pd.DataFrame:
     run_id = str(uuid.uuid4())
     log.info("run %s on %s\n%s\n-- binds: %s", run_id, engine.url.render_as_string(hide_password=True),
              statement.sql, statement.binds)
-    start = time.perf_counter()
-    try:  # opening the connection can fail too: a missing file, a lock, a refused login
-        with engine.connect() as con:
-            try:
-                df = times.to_utc(pd.read_sql(sql_text(statement.sql), con, params=statement.binds))
-            finally:
-                con.rollback()
-    except Exception as e:
-        log.warning("run %s failed after %.3f s: %s", run_id, time.perf_counter() - start, e)
-        e.run_id = run_id  # type: ignore[attr-defined] — the log entry to show next to the error
-        raise
+    with _ONE_AT_A_TIME.get(engine, nullcontext()):
+        if (gone := getattr(_WANTED, "gone", None)) is not None and gone.is_set():
+            log.info("run %s dropped: the page that asked for it was rerun", run_id)
+            raise Abandoned(run_id)
+        start = time.perf_counter()
+        try:  # opening the connection can fail too: a missing file, a lock, a refused login
+            with engine.connect() as con:
+                try:
+                    df = times.to_utc(pd.read_sql(sql_text(statement.sql), con, params=statement.binds))
+                finally:
+                    con.rollback()
+        except Exception as e:
+            log.warning("run %s failed after %.3f s: %s", run_id, time.perf_counter() - start, e)
+            e.run_id = run_id  # type: ignore[attr-defined] — the log entry to show next to the error
+            raise
     log.info("run %s: %d rows in %.3f s", run_id, len(df), time.perf_counter() - start)
     df.attrs["run_id"] = run_id
     return df

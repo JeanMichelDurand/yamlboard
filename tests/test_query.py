@@ -1,12 +1,13 @@
 from datetime import date, datetime, timedelta
 
+import pandas as pd
 import pytest
 
 from yamlboard import query as q
-from yamlboard.dialects import DIALECTS, for_name
+from yamlboard.dialects import DIALECTS, Dialect, for_name
 from yamlboard.engine import columns_for, dialect_of, engine_for, run
 from yamlboard.schema import Aggregation as A
-from yamlboard.schema import ChartType, Grain, Report
+from yamlboard.schema import ChartType, Grain, MeasureDef, Report, ViewFilter
 
 DUCK = DIALECTS["duckdb"]
 PG = DIALECTS["postgresql"]
@@ -76,7 +77,7 @@ def test_values_are_bound_not_inlined(sales, sales_params):
         (lambda r, p: q.count(r, DUCK, p, [q.Filter("amount", "between", (None, None))]), "at least one bound"),
         (lambda r, p: q.count(r, DUCK, p, [q.Filter("amount", "between", (20, 10))]), "20.0 is after 10.0"),
         (lambda r, p: q.count(r, DUCK, p, [q.Filter("region", "in", ())]), "at least one value"),
-        (lambda r, p: q.count(r, DUCK, p, [q.Filter("region", "contains", ("x",))]), "unknown filter operator"),
+        (lambda r, p: q.count(r, DUCK, p, [q.Filter("region", "starts_with", ("x",))]), "unknown filter operator"),
         (lambda r, p: q.count(r, DUCK, p, [q.Filter("region", "in", tuple(range(1001)))]), "at most 1000"),
         (lambda r, p: q.count(r, DUCK, p, [q.Filter("amount", "in", ("abc",))]), "not a valid number"),
         (lambda r, p: q.count(r, DUCK, p, [q.Filter("amount", "between", ("abc", 5))]), "not a valid number"),
@@ -109,6 +110,14 @@ def test_parameters(sales):
         q.coerce_parameters(sales, {"start": "yesterday", "end": today})
     with pytest.raises(q.InvalidParameters, match="unknown parameters: x"):
         q.coerce_parameters(sales, {"start": today, "end": today, "x": 1})
+
+
+def test_detail_sorts_by_several_keys(ws, sales, sales_params):
+    stmt = q.detail(sales, DUCK, sales_params, order=[("region", False), ("amount", True)], limit=200)
+    assert "ORDER BY region ASC, amount DESC" in stmt.sql
+    page = _run(ws, sales, stmt)
+    keys = list(zip(page["region"], -page["amount"].astype(float), strict=True))
+    assert keys == sorted(keys) and len(page) > 1
 
 
 def test_detail_pages_and_distinct(ws, sales, sales_params):
@@ -302,6 +311,9 @@ def test_default_view_is_what_the_board_opens_on(sales):
     pie = sales.model_copy(update={"view": sales.view.model_copy(update={"chart": ChartType.PIE})})
     pie_sql = q.default_view(pie, DUCK, {"start": date(2026, 1, 1), "end": date(2026, 2, 1)}).sql
     assert "region" not in pie_sql.split("GROUP BY")[1]                   # a pie has one dimension: no column split
+    north = sales.model_copy(update={"view": sales.view.model_copy(
+        update={"filters": (ViewFilter(field="region", values=("North",)),)})})
+    assert "North" in q.default_view(north, DUCK, {"start": date(2026, 1, 1), "end": date(2026, 2, 1)}).binds.values()
 
 
 def test_empty_string_is_a_value_not_null():
@@ -333,6 +345,26 @@ def test_timeframe_from_the_range_then_a_filter():
     assert q.default_grain(TS_RANGE, "ts", MARCH, hour) is Grain.MINUTE
     either = [*one_day, q.Filter("ts", "is_null")]                                 # alternatives: no narrowing
     assert q.default_grain(TS_RANGE, "ts", MARCH, either) is Grain.DAY
+
+
+def test_complete_periods_drop_the_cut_ends():
+    days = pd.Series(pd.date_range("2026-03-01", "2026-03-31", freq="D"))
+    whole = q.complete_periods(days, TS_RANGE, "ts", Grain.DAY, MARCH, at=datetime(2026, 3, 31, 12, 0))
+    assert not whole.iloc[-1] and whole.iloc[:-1].all()                          # today is not over
+    assert q.complete_periods(days, TS_RANGE, "ts", Grain.DAY, MARCH, at=datetime(2026, 5, 1)).all()
+    noon = {"start": datetime(2026, 3, 1, 12), "end": datetime(2026, 3, 31, 12)}  # a period ending now, by the hour
+    whole = q.complete_periods(days, TS_RANGE, "ts", Grain.DAY, noon, at=datetime(2026, 3, 31, 12))
+    assert whole.tolist() == [False] + [True] * 29 + [False]
+    weeks = pd.Series(pd.to_datetime(["2026-02-23", "2026-03-02", "2026-03-30"], utc=True))  # Mondays, aware
+    assert q.complete_periods(weeks, TS_RANGE, "ts", Grain.WEEK, MARCH, at=datetime(2026, 5, 1)).tolist() == [
+        False, True, False]                                                       # March 1st is a Sunday
+    one_day = [q.Filter("ts", "between", (date(2026, 3, 10), date(2026, 3, 10)))]
+    hours = pd.Series(pd.date_range("2026-03-10", periods=24, freq="h"))
+    assert q.complete_periods(hours, TS_RANGE, "ts", Grain.HOUR, MARCH, one_day, at=datetime(2026, 3, 10, 5, 30)
+                              ).sum() == 5                                        # the filter's day, up to now
+    empty = pd.Series([None, date(2026, 3, 31)], dtype=object)                    # a NULL group, a date result
+    assert q.complete_periods(empty, TS_RANGE, "ts", Grain.DAY, {"start": None, "end": None},
+                              at=datetime(2026, 3, 31, 8)).tolist() == [True, False]  # open ends: only now cuts
 
 
 def test_default_grain_without_a_period():
@@ -387,3 +419,87 @@ def test_examples_run_their_view(ws, rid, tmp_path, monkeypatch):
     params = q.coerce_parameters(report, span | {r.end: str(date.today()) for r in report.ranges})
     df = run(engine, q.default_view(report, DUCK, params, columns_map=columns_for(engine, report, params)))
     assert len(df) > 0 and df.iloc[:, -1].sum() > 0
+
+
+def test_contains_ignores_case_and_reads_wildcards_as_text():
+    assert _traps([q.Filter("kind", "contains", ("A",))]) == [1, 5]
+    assert _traps([q.Filter("kind", "not_contains", ("a",))]) == [2, 3, 4, 6]   # an exclusion keeps NULL rows
+    assert _traps([q.Filter("kind", "contains", ("%",))]) == []                 # a percent sign, not "anything"
+    assert _traps([q.Filter("kind", "contains", ("a",)), q.Filter("kind", "in", ("c",))]) == [1, 3, 5]  # either
+    engine = engine_for("duckdb:///:memory:")   # the ANSI form runs too: lower() LIKE lower()
+    ansi = q.detail(TRAPS, Dialect(), {}, [q.Filter("kind", "contains", ("B",))], order_by="n")
+    assert run(engine, ansi)["n"].tolist() == [2, 6]
+    with pytest.raises(q.NotAllowed):
+        q.count(TRAPS, DUCK, {}, [q.Filter("n", "contains", ("1",))])           # a text field only
+    with pytest.raises(q.NotAllowed):
+        q.count(TRAPS, DUCK, {}, [q.Filter("kind", "contains", ("",))])
+
+
+def test_a_search_is_the_filter_its_field_means():
+    f = TRAPS.field_map
+    assert q.search_filter(f["kind"], " Ab ") == q.Filter("kind", "contains", ("Ab",))
+    assert q.search_filter(f["n"], "1 234") == q.Filter("n", "in", (1234,))
+    assert q.search_filter(f["amount"], "1 234,5") == q.Filter("amount", "in", (1234.5,))
+    assert q.search_filter(f["amount"], "10..20") == q.Filter("amount", "between", (10.0, 20.0))
+    assert q.search_filter(f["amount"], ">=10") == q.Filter("amount", "between", (10.0, None))
+    assert q.search_filter(f["n"], "<= 3") == q.Filter("n", "between", (None, 3))
+    day = date(2026, 3, 1)
+    assert q.search_filter(f["ts"], "2026-03-01") == q.Filter("ts", "between", (day, day))
+    assert _traps([q.search_filter(f["ts"], "2026-03-01")]) == [1, 2]        # the whole day
+    with pytest.raises(q.NotAllowed):
+        q.search_filter(f["n"], "abc")
+
+
+def test_a_click_on_a_period_filters_the_whole_period():
+    f = TRAPS.field_map
+    march = datetime(2026, 3, 1)
+    assert q.pick_filter(f["ts"], march, Grain.DAY) == q.Filter("ts", "between", (date(2026, 3, 1), date(2026, 3, 1)))
+    assert _traps([q.pick_filter(f["ts"], march, Grain.DAY)]) == [1, 2]
+    assert q.pick_filter(f["ts"], march, Grain.MONTH).values == (date(2026, 3, 1), date(2026, 3, 31))
+    hour = q.pick_filter(f["ts"], datetime(2026, 3, 2, 12), Grain.HOUR)
+    assert _traps([hour]) == [3]
+    assert q.pick_filter(f["kind"], None) == q.Filter("kind", "is_null")
+    assert q.pick_filter(f["kind"], "a") == q.Filter("kind", "in", ("a",))
+
+
+def test_complete_periods_read_the_data_when_no_range_bounds_it():
+    from sqlalchemy import create_engine, text
+
+    hourly = Report.model_validate({
+        "id": "h", "title": "H",
+        "sql": "select t, 1 as n from range(timestamp '2026-03-01 14:00', timestamp '2026-03-05 11:00', "
+               "interval 1 hour) r(t)",
+        "fields": [{"name": "t", "type": "timestamp", "groupable_rows": True, "grains": ["day", "hour"]}]})
+    with create_engine("duckdb:///:memory:").connect() as con:
+        def run(g):
+            stmt = q.extents(hourly, DUCK, {}, q.Group("t", g))
+            return pd.DataFrame(con.execute(text(stmt.sql), stmt.binds).mappings().all())
+
+        days = run(Grain.DAY)
+        whole = q.complete_periods(days["yb_start"], hourly, "t", Grain.DAY, {}, spans=days)
+        assert [str(d.date()) for d in days["yb_start"][whole]] == ["2026-03-02", "2026-03-03", "2026-03-04"]
+        hours = run(Grain.HOUR)                                        # every hour full: none cut
+        assert q.complete_periods(hours["yb_start"], hourly, "t", Grain.HOUR, {}, spans=hours).all()
+        two = days.iloc[:2]                                            # nothing to compare with: none cut
+        assert q.complete_periods(two["yb_start"], hourly, "t", Grain.DAY, {}, spans=two).all()
+    with pytest.raises(q.NotAllowed, match="not a date period"):
+        q.extents(hourly, DUCK, {}, q.Group("t"))
+
+
+def test_a_default_view_of_several_measures_is_not_split(sales):
+    view = sales.view.model_copy(update={"measures": (MeasureDef(field="amount", aggregation="sum"), MeasureDef(),
+                                                      MeasureDef())})
+    stmt = q.default_view(sales.model_copy(update={"view": view}), DUCK, {"start": date(2026, 1, 1),
+                                                                          "end": date(2026, 2, 1)})
+    assert "region" not in stmt.sql.split("GROUP BY")[1]
+    assert '"sum_amount"' in stmt.sql and stmt.sql.count('AS "count"') == 1          # each measure once
+
+
+def test_a_set_clock_s_day_is_whole(monkeypatch):
+    from yamlboard import times
+
+    monkeypatch.setenv(times.TODAY_VAR, "2026-03-31")
+    days = pd.Series(pd.date_range("2026-03-01", "2026-03-31", freq="D"))
+    assert q.complete_periods(days, TS_RANGE, "ts", Grain.DAY, MARCH).all()
+    hours = pd.Series(pd.date_range("2026-03-31", periods=24, freq="h"))
+    assert q.complete_periods(hours, TS_RANGE, "ts", Grain.HOUR, MARCH).all()   # 23:00 too

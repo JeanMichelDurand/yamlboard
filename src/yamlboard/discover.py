@@ -207,7 +207,7 @@ def draft_report(
 
     Every ``:name`` of the SQL becomes a required parameter, typed by ``params`` (string otherwise).
     The view opens on the first date over time, else the first text field, measured by the sum of the
-    first number, else a row count.
+    first number, else a row count. Columns named as a latitude and a longitude make a ``map`` (see ``draft_map``).
     """
     params = dict(params or {})
     fields = [draft_field(str(c), infer_type(result[c])) for c in result.columns]
@@ -229,7 +229,9 @@ def draft_report(
 
     temporal = next((f for f in fields if "grains" in f), None)
     text = next((f for f in fields if f.get("groupable")), None)
-    number = next((f for f in fields if "sum" in f.get("measures", ())), None)
+    place = draft_map(fields)
+    coordinates = {place["lat"], place["lon"]} if place else set()  # never the measure: a sum of latitudes
+    number = next((f for f in fields if "sum" in f.get("measures", ()) and f["name"] not in coordinates), None)
     view: dict[str, Any] = {}
     if temporal:
         view |= {"rows": [temporal["name"]], "grains": {temporal["name"]: "month"}}
@@ -240,7 +242,25 @@ def draft_report(
     view["measures"] = [{"field": number["name"], "aggregation": "sum"} if number else {"field": "*"}]
     view["chart"] = "line" if temporal else "column"
     report["view"] = view
+    if place:
+        report["map"] = place
     return report
+
+
+_LAT = re.compile(r"(?:^|_)(lat|latitude)$", re.IGNORECASE)
+_LON = re.compile(r"(?:^|_)(lon|lng|long|longitude)$", re.IGNORECASE)
+
+
+def draft_map(fields: list[Mapping[str, Any]]) -> dict[str, str] | None:
+    """The ``map`` section of drafted ``fields``: number fields named as a latitude and a longitude (``lat``,
+    ``site_latitude``, ``lng``…) and the first text field as the label; None without both."""
+    numbers = [f["name"] for f in fields if FieldType(f.get("type", "string")).numeric]
+    lat = next((n for n in numbers if _LAT.search(n)), None)
+    lon = next((n for n in numbers if _LON.search(n)), None)
+    if not (lat and lon):
+        return None
+    label = next((f["name"] for f in fields if f.get("type", "string") == "string"), None)
+    return {"lat": lat, "lon": lon} | ({"label": label} if label else {})
 
 
 class _Dumper(yaml.SafeDumper):
@@ -262,3 +282,68 @@ _Dumper.add_representer(list, _list)
 
 def to_yaml(report: Mapping[str, Any]) -> str:
     return yaml.dump(dict(report), Dumper=_Dumper, sort_keys=False, allow_unicode=True, width=120)
+
+
+def with_section(text: str, key: str, value: Any) -> str:
+    """The report YAML ``text`` with ``value`` as its top-level ``key:`` section, the rest as written; ``value``
+    None takes the section out.
+
+    Only the section's own lines change, its comments with it; with no such section, it goes at the end.
+    The comments and blank lines after the section stay, for they open the key below.
+    """
+    lines = text.splitlines(keepends=True)
+    block = "" if value is None else to_yaml({key: value})
+    start = next((i for i, line in enumerate(lines) if re.match(rf"{re.escape(key)}\s*:", line)), None)
+    if start is None:
+        return text + ("" if not text or text.endswith("\n") or not block else "\n") + block
+    end = start + 1
+    for i in range(start + 1, len(lines)):
+        item = lines[i].startswith("-") and not lines[i].startswith("---")  # a list item as to_yaml writes it
+        if lines[i][:1] not in ("", " ", "\t", "\n", "\r", "#") and not item:  # the next key, or a document end
+            break
+        if lines[i].strip() and not lines[i].lstrip().startswith("#"):
+            end = i + 1  # an indented line of the section
+    return "".join(lines[:start]) + block + "".join(lines[end:])
+
+
+def with_view(text: str, view: Mapping[str, Any]) -> str:
+    """``text`` with ``view`` as its ``view:`` section (see ``with_section``)."""
+    return with_section(text, "view", dict(view))
+
+
+# What a field's permissions are written as, and the legacy or shortcut keys they replace.
+_FIELD_KEYS = {"type": (), "visible": ("affichageDefaut",), "filterable": ("filtrage",),
+               "groupable_rows": ("agregationLigne", "groupable"),
+               "groupable_columns": ("agregationColone", "agregationColonne", "groupable"),
+               "grains": ("availableGroupingDateType",), "measures": ()}
+
+
+def _field_entry(item: Mapping[str, Any], edit: Mapping[str, Any]) -> dict[str, Any]:
+    """A ``result_columns`` entry with ``edit``'s permissions, in canonical keys; its other keys as they were.
+
+    Defaults are left out: a string type, visible, not filterable, no grain… ``groupable`` when both are true.
+    """
+    replaced = set(_FIELD_KEYS) | {k for alias in _FIELD_KEYS.values() for k in alias}
+    out = {k: v for k, v in item.items() if k in ("name", "mapping", "label")}
+    if edit["type"] != FieldType.STRING.value:
+        out["type"] = edit["type"]
+    if not edit["visible"]:
+        out["visible"] = False
+    if edit["filterable"]:
+        out["filterable"] = True
+    if edit["groupable_rows"] and edit["groupable_columns"]:
+        out["groupable"] = True
+    else:
+        out |= {k: True for k in ("groupable_rows", "groupable_columns") if edit[k]}
+    out |= {k: list(edit[k]) for k in ("grains", "measures") if edit[k]}
+    return out | {k: v for k, v in item.items() if k not in out and k not in replaced}
+
+
+def with_fields(text: str, edits: Mapping[str, Mapping[str, Any]]) -> str:
+    """``text`` with each field named in ``edits`` given those permissions (``_FIELD_KEYS``): the ``result_columns``
+    section (``fields`` in an older file) is written again, the rest as written."""
+    doc = yaml.safe_load(text)
+    key = "result_columns" if "result_columns" in doc else "fields"
+    items = [_field_entry(i, edits[name]) if isinstance(i, dict) and (name := i.get("name", i.get("mapping"))) in edits
+             else i for i in doc.get(key) or []]
+    return with_section(text, key, items)

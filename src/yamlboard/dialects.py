@@ -62,6 +62,10 @@ class Dialect:
         """Run on every new connection: the session computes in UTC (``times``)."""
         return "SET TimeZone = 'UTC'"
 
+    def contains(self, col: str, pattern: str) -> str:
+        """``col`` matches the LIKE ``pattern``, ignoring case; ``\\`` escapes its wildcards."""
+        return f"lower(CAST({col} AS VARCHAR)) LIKE lower({pattern}) ESCAPE '\\'"
+
     def limit(self, limit: int, offset: int = 0) -> str:
         return f"LIMIT {int(limit)}" + (f" OFFSET {int(offset)}" if offset else "")
 
@@ -73,10 +77,16 @@ class DuckDB(Dialect):
     def median(self, expr: str) -> str:
         return f"median({expr})"
 
+    def contains(self, col: str, pattern: str) -> str:
+        return f"CAST({col} AS VARCHAR) ILIKE {pattern} ESCAPE '\\'"
+
 
 class Postgres(Dialect):
     name = "postgresql"
     reserved = frozenset(_POSTGRES_WORDS.split())
+
+    def contains(self, col: str, pattern: str) -> str:
+        return f"CAST({col} AS VARCHAR) ILIKE {pattern} ESCAPE '\\'"
 
 
 DIALECTS: dict[str, Dialect] = {d.name: d for d in (DuckDB(), Postgres())}
